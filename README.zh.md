@@ -121,6 +121,43 @@ cp target/release/autocli /usr/local/bin/   # macOS / Linux
 
 > Public 模式命令（hackernews、devto、lobsters 等）无需安装扩展即可使用。
 
+### 可选：Chrome Tab Group 严格后台模式
+
+浏览器命令默认仍使用原有的 automation window。需要避免新建可见 Chrome 窗口时，可以显式启用 Tab Group 严格后台模式：
+
+```json
+{
+  "browser": {
+    "carrier": "tab-group-background",
+    "groupName": "work",
+    "groupIdleTimeoutSeconds": 30
+  }
+}
+```
+
+也可以用环境变量覆盖：
+
+```bash
+AUTOCLI_BROWSER_CARRIER=tab-group-background
+AUTOCLI_BROWSER_GROUP_NAME=work
+AUTOCLI_BROWSER_GROUP_IDLE_TIMEOUT=30
+```
+
+启用后组名统一为 `AutoCLI-${groupName}`，同名 Tab Group 会被复用；未设置或留空 `groupName` 时默认为 `default`，即 `AutoCLI-default`。该模式严格不创建新的可见 Chrome 窗口、不切换到 AutoCLI 标签、不抢当前活动标签；如果 Chrome、扩展或现有普通 Chrome 窗口不可用，会直接报错，不会自动回退到新窗口或激活标签。`tabs select` 在该模式下不可用。
+
+命令结束时会短暂保留同一组用于连续命令；空闲超时后只清理 AutoCLI 在该组内创建的标签。回滚到旧行为时，删除这些环境变量或将 `carrier` 改回 `automation-window`。
+
+自定义本地 adapter 也可以单独指定浏览器承载方式，且会覆盖全局配置和环境变量：
+
+```yaml
+browser:
+  carrier: tab-group-background
+  groupName: work
+  groupIdleTimeoutSeconds: 30
+```
+
+现有写法 `browser: true` / `browser: false` 仍然兼容。若 adapter 或全局配置显式选择 `tab-group-background` 但没有提供有效 `groupName`，默认使用 `default`。
+
 ## Skill 安装
 
 一键为你的 AI Agent 安装 autocli skill：

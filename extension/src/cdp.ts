@@ -64,6 +64,7 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
       lastError = e instanceof Error ? e.message : String(e);
       if (attempt < MAX_ATTACH_RETRIES) {
         console.warn(`[autocli] attach attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError}, retrying in ${RETRY_DELAY_MS}ms...`);
+        await cleanupBeforeAttachRetry(tabId);
         await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
         // Re-verify tab URL before retrying (it may have changed)
         try {
@@ -102,6 +103,21 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
     await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable');
   } catch {
     // Some pages may not need explicit enable
+  }
+}
+
+async function cleanupBeforeAttachRetry(tabId: number): Promise<void> {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const roots = document.querySelectorAll('[data-autocli-transient="true"]');
+        roots.forEach((node) => node.remove());
+        return { removed: roots.length };
+      },
+    });
+  } catch {
+    // Cleanup is best-effort; retry attach remains the real gate.
   }
 }
 

@@ -15,6 +15,15 @@ pub struct DaemonCommand {
     pub tab_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<String>,
+    #[serde(rename = "groupName", skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
+    #[serde(
+        rename = "groupIdleTimeoutSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub group_idle_timeout_seconds: Option<u64>,
 }
 
 impl DaemonCommand {
@@ -27,6 +36,9 @@ impl DaemonCommand {
             workspace: None,
             tab_id: None,
             format: None,
+            carrier: None,
+            group_name: None,
+            group_idle_timeout_seconds: None,
         }
     }
 
@@ -52,6 +64,21 @@ impl DaemonCommand {
 
     pub fn with_format(mut self, format: impl Into<String>) -> Self {
         self.format = Some(format.into());
+        self
+    }
+
+    pub fn with_carrier(mut self, carrier: impl Into<String>) -> Self {
+        self.carrier = Some(carrier.into());
+        self
+    }
+
+    pub fn with_group_name(mut self, group_name: impl Into<String>) -> Self {
+        self.group_name = Some(group_name.into());
+        self
+    }
+
+    pub fn with_group_idle_timeout_seconds(mut self, seconds: u64) -> Self {
+        self.group_idle_timeout_seconds = Some(seconds);
         self
     }
 }

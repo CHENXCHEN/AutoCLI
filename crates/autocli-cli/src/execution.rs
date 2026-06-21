@@ -1,9 +1,9 @@
+use autocli_browser::BrowserBridge;
 use autocli_core::{CliCommand, CliError, IPage};
 use autocli_pipeline::{execute_pipeline, steps::register_all_steps, StepRegistry};
-use autocli_browser::BrowserBridge;
 use serde_json::Value;
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Get daemon port from env or default
 fn daemon_port() -> u16 {
@@ -56,12 +56,15 @@ async fn execute_command_inner(
 
     if cmd.needs_browser() {
         // Browser session
-        let mut bridge = BrowserBridge::new(daemon_port());
+        let mut bridge =
+            BrowserBridge::new(daemon_port()).with_browser_options(cmd.browser_options.clone());
         let page = bridge.connect().await?;
 
         // Pre-navigate to domain if set, but ONLY if the pipeline doesn't
         // start with its own navigate step (to avoid double navigation).
-        let pipeline_starts_with_navigate = cmd.pipeline.as_ref()
+        let pipeline_starts_with_navigate = cmd
+            .pipeline
+            .as_ref()
             .and_then(|steps| steps.first())
             .and_then(|step| step.as_object())
             .map_or(false, |obj| obj.contains_key("navigate"));
@@ -94,7 +97,6 @@ async fn execute_command_inner(
         run_command(cmd, None, &kwargs, &registry).await
     }
 }
-
 
 async fn run_command(
     cmd: &CliCommand,

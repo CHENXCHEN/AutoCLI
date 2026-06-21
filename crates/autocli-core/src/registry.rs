@@ -40,8 +40,7 @@ impl Registry {
     }
 
     pub fn all_commands(&self) -> Vec<&CliCommand> {
-        let mut cmds: Vec<&CliCommand> =
-            self.commands.values().flat_map(|s| s.values()).collect();
+        let mut cmds: Vec<&CliCommand> = self.commands.values().flat_map(|s| s.values()).collect();
         cmds.sort_by(|a, b| (&a.site, &a.name).cmp(&(&b.site, &b.name)));
         cmds
     }
@@ -68,6 +67,7 @@ mod tests {
             domain: None,
             strategy: Strategy::Public,
             browser: false,
+            browser_options: None,
             args: vec![],
             columns: vec![],
             pipeline: None,

@@ -1,8 +1,9 @@
-use autocli_core::{CliError, IPage};
+use autocli_core::{BrowserOptions, CliError, IPage};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+use crate::config::{load_browser_config_with_options, BrowserCarrier, BrowserConfig};
 use crate::daemon_client::DaemonClient;
 use crate::page::DaemonPage;
 
@@ -17,16 +18,42 @@ const EXTENSION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// The daemon runs as a detached background process with its own idle-shutdown lifecycle.
 pub struct BrowserBridge {
     port: u16,
+    browser_config: Option<BrowserConfig>,
+    browser_options: Option<BrowserOptions>,
 }
 
 impl BrowserBridge {
     pub fn new(port: u16) -> Self {
-        Self { port }
+        Self {
+            port,
+            browser_config: None,
+            browser_options: None,
+        }
+    }
+
+    pub fn with_browser_config(port: u16, browser_config: BrowserConfig) -> Self {
+        Self {
+            port,
+            browser_config: Some(browser_config),
+            browser_options: None,
+        }
+    }
+
+    pub fn with_browser_options(mut self, browser_options: Option<BrowserOptions>) -> Self {
+        self.browser_options = browser_options;
+        self
     }
 
     /// Create a bridge using the default port.
     pub fn default_port() -> Self {
         Self::new(DEFAULT_PORT)
+    }
+
+    fn should_wake_chrome_for_extension_recovery(&self) -> bool {
+        !matches!(
+            self.browser_config.as_ref().map(|cfg| &cfg.carrier),
+            Some(BrowserCarrier::TabGroupBackground)
+        )
     }
 
     /// Connect to the daemon, starting it if necessary, and return a trait-object page.
@@ -37,6 +64,7 @@ impl BrowserBridge {
     /// Connect and return the concrete `DaemonPage` so callers can use
     /// daemon-specific methods (e.g. `read_article`) not on the `IPage` trait.
     pub async fn connect_daemon_page(&mut self) -> Result<Arc<DaemonPage>, CliError> {
+        let browser_config = self.browser_config()?;
         let client = Arc::new(DaemonClient::new(self.port));
 
         // Step 1: Check Chrome is running
@@ -61,8 +89,27 @@ impl BrowserBridge {
         }
 
         // Step 3: Wait up to 5s for extension to connect
-        if self.poll_extension(&client, EXTENSION_INITIAL_WAIT, false).await {
-            return Ok(Arc::new(DaemonPage::new(client, "default")));
+        if self
+            .poll_extension(&client, EXTENSION_INITIAL_WAIT, false)
+            .await
+        {
+            return Ok(Arc::new(DaemonPage::new_with_browser_config(
+                client,
+                "default",
+                browser_config.clone(),
+            )));
+        }
+
+        if !self.should_wake_chrome_for_extension_recovery() {
+            return Err(CliError::BrowserConnect {
+                message: "Chrome extension not connected in strict-background mode".into(),
+                suggestions: vec![
+                    "Open an existing normal Chrome window with the AutoCLI extension already enabled".into(),
+                    "Strict background mode will not open Chrome, create a new window, or wake the extension with about:blank".into(),
+                    format!("The daemon is listening on port {}", self.port),
+                ],
+                source: None,
+            });
         }
 
         // Step 4: Extension not connected — try to wake up Chrome
@@ -71,8 +118,15 @@ impl BrowserBridge {
         wake_chrome();
 
         // Step 5: Wait remaining 25s with progress
-        if self.poll_extension(&client, EXTENSION_REMAINING_WAIT, true).await {
-            return Ok(Arc::new(DaemonPage::new(client, "default")));
+        if self
+            .poll_extension(&client, EXTENSION_REMAINING_WAIT, true)
+            .await
+        {
+            return Ok(Arc::new(DaemonPage::new_with_browser_config(
+                client,
+                "default",
+                browser_config.clone(),
+            )));
         }
 
         warn!("Chrome extension is not connected to the daemon");
@@ -165,6 +219,18 @@ impl BrowserBridge {
             READY_TIMEOUT.as_secs()
         )))
     }
+
+    fn browser_config(&mut self) -> Result<BrowserConfig, CliError> {
+        if self.browser_config.is_none() {
+            self.browser_config = Some(load_browser_config_with_options(
+                self.browser_options.as_ref(),
+            )?);
+        }
+        Ok(self
+            .browser_config
+            .clone()
+            .unwrap_or_else(BrowserConfig::default))
+    }
 }
 
 /// Check if Chrome/Chromium is running as a process.
@@ -242,5 +308,25 @@ mod tests {
     fn test_bridge_default_port() {
         let bridge = BrowserBridge::default_port();
         assert_eq!(bridge.port, DEFAULT_PORT);
+    }
+
+    #[test]
+    fn tab_group_background_does_not_use_chrome_wake_path() {
+        let bridge = BrowserBridge::with_browser_config(
+            19925,
+            BrowserConfig {
+                carrier: BrowserCarrier::TabGroupBackground,
+                group_name: Some("work".to_string()),
+                group_idle_timeout_seconds: Some(30),
+            },
+        );
+
+        assert!(!bridge.should_wake_chrome_for_extension_recovery());
+    }
+
+    #[test]
+    fn automation_window_keeps_chrome_wake_path() {
+        let bridge = BrowserBridge::new(19925);
+        assert!(bridge.should_wake_chrome_for_extension_recovery());
     }
 }

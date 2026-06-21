@@ -7,9 +7,11 @@
  * dispatches them to Chrome APIs (debugger/tabs/cookies), returns results.
  */
 
-import type { Command, Result } from './protocol';
+import type { BrowserCarrier, Command, Result } from './protocol';
 import { DAEMON_WS_URL, DAEMON_PING_URL, WS_RECONNECT_BASE_DELAY, WS_RECONNECT_MAX_DELAY } from './protocol';
 import * as executor from './cdp';
+
+type SelectorWindow = Window & typeof globalThis & { __autocliSelectorActive?: boolean };
 
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -144,11 +146,57 @@ type AutomationSession = {
   idleDeadlineAt: number;
 };
 
+type TabGroupSession = {
+  groupId: number;
+  windowId: number;
+  title: string;
+  ownedTabIds: Set<number>;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  idleDeadlineAt: number;
+};
+
 const automationSessions = new Map<string, AutomationSession>();
+const tabGroupSessions = new Map<string, TabGroupSession>();
 const WINDOW_IDLE_TIMEOUT = 30000; // 30s — quick cleanup after command finishes
 
 function getWorkspaceKey(workspace?: string): string {
   return workspace?.trim() || 'default';
+}
+
+function getCarrier(cmd: Command): BrowserCarrier {
+  const carrier = cmd.carrier ?? 'automation-window';
+  if (carrier !== 'automation-window' && carrier !== 'tab-group-background') {
+    throw new Error(`Unknown browser carrier: ${carrier}`);
+  }
+  return carrier;
+}
+
+function isTabGroupCarrier(cmd: Command): boolean {
+  return getCarrier(cmd) === 'tab-group-background';
+}
+
+function getGroupTitle(cmd: Command): string {
+  const name = cmd.groupName?.trim();
+  if (!name) throw new Error('strict-background group name is required');
+  if (name.includes('\n') || name.includes('\r')) throw new Error('strict-background group name cannot contain newlines');
+  return `AutoCLI-${name}`;
+}
+
+function getTabGroupSessionKey(workspace: string, title: string): string {
+  return `${workspace}\n${title}`;
+}
+
+function getTabGroupIdleTimeout(cmd: Command): number {
+  const seconds = cmd.groupIdleTimeoutSeconds;
+  if (seconds === undefined) return WINDOW_IDLE_TIMEOUT;
+  if (!Number.isFinite(seconds) || seconds <= 0) throw new Error('strict-background group idle timeout must be positive');
+  return seconds * 1000;
+}
+
+function validateStrictBackgroundCommand(cmd: Command): void {
+  if (!isTabGroupCarrier(cmd)) return;
+  getGroupTitle(cmd);
+  getTabGroupIdleTimeout(cmd);
 }
 
 function resetWindowIdleTimer(workspace: string): void {
@@ -167,6 +215,37 @@ function resetWindowIdleTimer(workspace: string): void {
     }
     automationSessions.delete(workspace);
   }, WINDOW_IDLE_TIMEOUT);
+}
+
+function resetTabGroupIdleTimer(workspace: string, cmd: Command): void {
+  if (!isTabGroupCarrier(cmd)) return;
+  let title: string;
+  try {
+    title = getGroupTitle(cmd);
+  } catch {
+    return;
+  }
+  const key = getTabGroupSessionKey(workspace, title);
+  const session = tabGroupSessions.get(key);
+  if (!session) return;
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  const timeout = getTabGroupIdleTimeout(cmd);
+  session.idleDeadlineAt = Date.now() + timeout;
+  session.idleTimer = setTimeout(async () => {
+    const current = tabGroupSessions.get(key);
+    if (!current) return;
+    const ownedTabIds = [...current.ownedTabIds];
+    if (ownedTabIds.length > 0) {
+      try {
+        await chrome.tabs.remove(ownedTabIds);
+      } catch {
+        // Some or all tabs may already be gone.
+      }
+    }
+    current.ownedTabIds.clear();
+    tabGroupSessions.delete(key);
+    console.log(`[autocli] Tab group ${current.title} (${workspace}) released (idle timeout)`);
+  }, timeout);
 }
 
 /** Get or create the dedicated automation window.
@@ -282,9 +361,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 async function handleCommand(cmd: Command): Promise<Result> {
   const workspace = getWorkspaceKey(cmd.workspace);
-  // Reset idle timer on every command (window stays alive while active)
-  resetWindowIdleTimer(workspace);
   try {
+    validateStrictBackgroundCommand(cmd);
+
+    // Reset idle timer on every command (window/group stays alive while active).
+    if (isTabGroupCarrier(cmd)) resetTabGroupIdleTimer(workspace, cmd);
+    else resetWindowIdleTimer(workspace);
+
     switch (cmd.action) {
       case 'exec':
         return await handleExec(cmd, workspace);
@@ -365,11 +448,114 @@ function setWorkspaceSession(workspace: string, session: Pick<AutomationSession,
 
 type ResolvedTab = { tabId: number; tab: chrome.tabs.Tab | null };
 
+async function getHostWindowId(): Promise<number> {
+  try {
+    const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
+    if (lastFocused.id !== undefined) return lastFocused.id;
+  } catch {
+    // Fall through to getAll.
+  }
+  const windows = await chrome.windows.getAll({ windowTypes: ['normal'] });
+  const host = windows.find((win) => win.id !== undefined);
+  if (host?.id === undefined) {
+    throw new Error('strict-background mode requires an existing normal Chrome window');
+  }
+  return host.id;
+}
+
+async function getTabGroupSession(workspace: string, cmd: Command): Promise<TabGroupSession> {
+  const title = getGroupTitle(cmd);
+  const key = getTabGroupSessionKey(workspace, title);
+  const existing = tabGroupSessions.get(key);
+  if (existing) {
+    try {
+      await chrome.tabGroups.get(existing.groupId);
+      return existing;
+    } catch {
+      tabGroupSessions.delete(key);
+    }
+  }
+
+  const exactGroups = (await chrome.tabGroups.query({ title }))
+    .filter((group) => group.id !== undefined && group.title === title);
+  const reusable = exactGroups[0];
+  if (reusable?.id !== undefined) {
+    const groupTabs = await chrome.tabs.query({ groupId: reusable.id });
+    const windowId = reusable.windowId ?? groupTabs[0]?.windowId;
+    if (windowId === undefined) {
+      throw new Error(`strict-background group ${title} has no normal host window`);
+    }
+    const session: TabGroupSession = {
+      groupId: reusable.id,
+      windowId,
+      title,
+      ownedTabIds: new Set(),
+      idleTimer: null,
+      idleDeadlineAt: Date.now() + getTabGroupIdleTimeout(cmd),
+    };
+    tabGroupSessions.set(key, session);
+    resetTabGroupIdleTimer(workspace, cmd);
+    return session;
+  }
+
+  const windowId = await getHostWindowId();
+  const seedTab = await chrome.tabs.create({ windowId, url: BLANK_PAGE, active: false });
+  if (!seedTab.id) throw new Error('Failed to create strict-background seed tab');
+  const groupId = await chrome.tabs.group({ tabIds: [seedTab.id] });
+  await chrome.tabGroups.update(groupId, { title, color: 'blue', collapsed: true });
+  const session: TabGroupSession = {
+    groupId,
+    windowId,
+    title,
+    ownedTabIds: new Set([seedTab.id]),
+    idleTimer: null,
+    idleDeadlineAt: Date.now() + getTabGroupIdleTimeout(cmd),
+  };
+  tabGroupSessions.set(key, session);
+  resetTabGroupIdleTimer(workspace, cmd);
+  return session;
+}
+
+async function resolveTabGroupTab(tabId: number | undefined, workspace: string, cmd: Command, initialUrl?: string): Promise<ResolvedTab> {
+  const session = await getTabGroupSession(workspace, cmd);
+
+  if (tabId !== undefined) {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.groupId !== session.groupId) {
+      throw new Error(`Tab ${tabId} is not in strict-background group ${session.title}`);
+    }
+    if (!session.ownedTabIds.has(tabId)) {
+      throw new Error(`Tab ${tabId} is not owned by AutoCLI strict-background session ${session.title}`);
+    }
+    if (!isDebuggableUrl(tab.url)) {
+      throw new Error(`Tab ${tabId} URL is not debuggable (${tab.url})`);
+    }
+    return { tabId, tab };
+  }
+
+  const tabs = await chrome.tabs.query({ groupId: session.groupId });
+  const debuggableTab = tabs.find((tab) =>
+    tab.id !== undefined && session.ownedTabIds.has(tab.id) && isDebuggableUrl(tab.url)
+  );
+  if (debuggableTab?.id) return { tabId: debuggableTab.id, tab: debuggableTab };
+
+  const startUrl = initialUrl && isSafeNavigationUrl(initialUrl) ? initialUrl : BLANK_PAGE;
+  const tab = await chrome.tabs.create({ windowId: session.windowId, url: startUrl, active: false });
+  if (!tab.id) throw new Error('Failed to create strict-background tab');
+  await chrome.tabs.group({ groupId: session.groupId, tabIds: [tab.id] });
+  session.ownedTabIds.add(tab.id);
+  return { tabId: tab.id, tab };
+}
+
 /**
  * Resolve target tab in the automation window, returning both the tabId and
  * the Tab object (when available) so callers can skip a redundant chrome.tabs.get().
  */
-async function resolveTab(tabId: number | undefined, workspace: string, initialUrl?: string): Promise<ResolvedTab> {
+async function resolveTab(tabId: number | undefined, workspace: string, initialUrl?: string, cmd?: Command): Promise<ResolvedTab> {
+  if (cmd && isTabGroupCarrier(cmd)) {
+    return resolveTabGroupTab(tabId, workspace, cmd, initialUrl);
+  }
+
   // Even when an explicit tabId is provided, validate it is still debuggable.
   if (tabId !== undefined) {
     try {
@@ -427,8 +613,8 @@ async function resolveTab(tabId: number | undefined, workspace: string, initialU
 }
 
 /** Convenience wrapper returning just the tabId (used by most handlers) */
-async function resolveTabId(tabId: number | undefined, workspace: string, initialUrl?: string): Promise<number> {
-  const resolved = await resolveTab(tabId, workspace, initialUrl);
+async function resolveTabId(tabId: number | undefined, workspace: string, initialUrl?: string, cmd?: Command): Promise<number> {
+  const resolved = await resolveTab(tabId, workspace, initialUrl, cmd);
   return resolved.tabId;
 }
 
@@ -448,9 +634,24 @@ async function listAutomationWebTabs(workspace: string): Promise<chrome.tabs.Tab
   return tabs.filter((tab) => isDebuggableUrl(tab.url));
 }
 
+async function listTabGroupWebTabs(workspace: string, cmd: Command): Promise<chrome.tabs.Tab[]> {
+  const session = await getTabGroupSession(workspace, cmd);
+  const tabs = await chrome.tabs.query({ groupId: session.groupId });
+  return tabs.filter((tab) =>
+    tab.id !== undefined && session.ownedTabIds.has(tab.id) && isDebuggableUrl(tab.url)
+  );
+}
+
+function removeOwnedTab(workspace: string, cmd: Command, tabId: number): void {
+  if (!isTabGroupCarrier(cmd)) return;
+  const title = getGroupTitle(cmd);
+  const session = tabGroupSessions.get(getTabGroupSessionKey(workspace, title));
+  session?.ownedTabIds.delete(tabId);
+}
+
 async function handleExec(cmd: Command, workspace: string): Promise<Result> {
   if (!cmd.code) return { id: cmd.id, ok: false, error: 'Missing code' };
-  const tabId = await resolveTabId(cmd.tabId, workspace);
+  const tabId = await resolveTabId(cmd.tabId, workspace, undefined, cmd);
   try {
     const aggressive = workspace.startsWith('operate:');
     const data = await executor.evaluateAsync(tabId, cmd.code, aggressive);
@@ -466,7 +667,7 @@ async function handleNavigate(cmd: Command, workspace: string): Promise<Result> 
     return { id: cmd.id, ok: false, error: 'Blocked URL scheme -- only http:// and https:// are allowed' };
   }
   // Pass target URL so that first-time window creation can start on the right domain
-  const resolved = await resolveTab(cmd.tabId, workspace, cmd.url);
+  const resolved = await resolveTab(cmd.tabId, workspace, cmd.url, cmd);
   const tabId = resolved.tabId;
 
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
@@ -546,7 +747,7 @@ async function handleNavigate(cmd: Command, workspace: string): Promise<Result> 
   // during navigation (e.g. a tab-management extension regrouped it),
   // try to move it back to maintain session isolation.
   const session = automationSessions.get(workspace);
-  if (session && tab.windowId !== session.windowId) {
+  if (!isTabGroupCarrier(cmd) && session && tab.windowId !== session.windowId) {
     console.warn(`[autocli] Tab ${tabId} drifted to window ${tab.windowId} during navigation, moving back to ${session.windowId}`);
     try {
       await chrome.tabs.move(tabId, { windowId: session.windowId, index: -1 });
@@ -566,7 +767,9 @@ async function handleNavigate(cmd: Command, workspace: string): Promise<Result> 
 async function handleTabs(cmd: Command, workspace: string): Promise<Result> {
   switch (cmd.op) {
     case 'list': {
-      const tabs = await listAutomationWebTabs(workspace);
+      const tabs = isTabGroupCarrier(cmd)
+        ? await listTabGroupWebTabs(workspace, cmd)
+        : await listAutomationWebTabs(workspace);
       const data = tabs
         .map((t, i) => ({
           index: i,
@@ -581,25 +784,41 @@ async function handleTabs(cmd: Command, workspace: string): Promise<Result> {
       if (cmd.url && !isSafeNavigationUrl(cmd.url)) {
         return { id: cmd.id, ok: false, error: 'Blocked URL scheme -- only http:// and https:// are allowed' };
       }
+      if (isTabGroupCarrier(cmd)) {
+        const session = await getTabGroupSession(workspace, cmd);
+        const tab = await chrome.tabs.create({ windowId: session.windowId, url: cmd.url ?? BLANK_PAGE, active: false });
+        if (!tab.id) return { id: cmd.id, ok: false, error: 'Failed to create strict-background tab' };
+        await chrome.tabs.group({ groupId: session.groupId, tabIds: [tab.id] });
+        session.ownedTabIds.add(tab.id);
+        resetTabGroupIdleTimer(workspace, cmd);
+        return { id: cmd.id, ok: true, data: { tabId: tab.id, url: tab.url } };
+      }
       const windowId = await getAutomationWindow(workspace);
       const tab = await chrome.tabs.create({ windowId, url: cmd.url ?? BLANK_PAGE, active: true });
       return { id: cmd.id, ok: true, data: { tabId: tab.id, url: tab.url } };
     }
     case 'close': {
       if (cmd.index !== undefined) {
-        const tabs = await listAutomationWebTabs(workspace);
+        const tabs = isTabGroupCarrier(cmd)
+          ? await listTabGroupWebTabs(workspace, cmd)
+          : await listAutomationWebTabs(workspace);
         const target = tabs[cmd.index];
         if (!target?.id) return { id: cmd.id, ok: false, error: `Tab index ${cmd.index} not found` };
         await chrome.tabs.remove(target.id);
         await executor.detach(target.id);
+        removeOwnedTab(workspace, cmd, target.id);
         return { id: cmd.id, ok: true, data: { closed: target.id } };
       }
-      const tabId = await resolveTabId(cmd.tabId, workspace);
+      const tabId = await resolveTabId(cmd.tabId, workspace, undefined, cmd);
       await chrome.tabs.remove(tabId);
       await executor.detach(tabId);
+      removeOwnedTab(workspace, cmd, tabId);
       return { id: cmd.id, ok: true, data: { closed: tabId } };
     }
     case 'select': {
+      if (isTabGroupCarrier(cmd)) {
+        return { id: cmd.id, ok: false, error: 'unsupported-operation: tabs select is disabled in strict-background mode' };
+      }
       if (cmd.index === undefined && cmd.tabId === undefined)
         return { id: cmd.id, ok: false, error: 'Missing index or tabId' };
       if (cmd.tabId !== undefined) {
@@ -648,7 +867,7 @@ async function handleCookies(cmd: Command): Promise<Result> {
 }
 
 async function handleScreenshot(cmd: Command, workspace: string): Promise<Result> {
-  const tabId = await resolveTabId(cmd.tabId, workspace);
+  const tabId = await resolveTabId(cmd.tabId, workspace, undefined, cmd);
   try {
     const data = await executor.screenshot(tabId, {
       format: cmd.format,
@@ -690,7 +909,7 @@ async function handleCdp(cmd: Command, workspace: string): Promise<Result> {
   if (!CDP_ALLOWLIST.has(cmd.cdpMethod)) {
     return { id: cmd.id, ok: false, error: `CDP method not permitted: ${cmd.cdpMethod}` };
   }
-  const tabId = await resolveTabId(cmd.tabId, workspace);
+  const tabId = await resolveTabId(cmd.tabId, workspace, undefined, cmd);
   try {
     const aggressive = workspace.startsWith('operate:');
     await executor.ensureAttached(tabId, aggressive);
@@ -706,6 +925,11 @@ async function handleCdp(cmd: Command, workspace: string): Promise<Result> {
 }
 
 async function handleCloseWindow(cmd: Command, workspace: string): Promise<Result> {
+  if (isTabGroupCarrier(cmd)) {
+    validateStrictBackgroundCommand(cmd);
+    resetTabGroupIdleTimer(workspace, cmd);
+    return { id: cmd.id, ok: true, data: { released: true } };
+  }
   const session = automationSessions.get(workspace);
   if (session) {
     try {
@@ -723,7 +947,7 @@ async function handleSetFileInput(cmd: Command, workspace: string): Promise<Resu
   if (!cmd.files || !Array.isArray(cmd.files) || cmd.files.length === 0) {
     return { id: cmd.id, ok: false, error: 'Missing or empty files array' };
   }
-  const tabId = await resolveTabId(cmd.tabId, workspace);
+  const tabId = await resolveTabId(cmd.tabId, workspace, undefined, cmd);
   try {
     await executor.setFileInputFiles(tabId, cmd.files, cmd.selector);
     return { id: cmd.id, ok: true, data: { count: cmd.files.length } };
@@ -832,8 +1056,10 @@ async function handleSessions(cmd: Command): Promise<Result> {
 
 export const __test__ = {
   handleNavigate,
+  handleCommand,
   isTargetUrl,
   handleTabs,
+  handleCloseWindow,
   handleSessions,
   resolveTabId,
   resetWindowIdleTimer,
@@ -942,7 +1168,7 @@ chrome.action.onClicked.addListener(async (tab) => {
     // Check if already injected — if so, just toggle
     const [result] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func: () => !!window.__autocliSelectorActive,
+      func: () => !!(window as SelectorWindow).__autocliSelectorActive,
     });
     if (result?.result) {
       // Already injected, re-run content.js to toggle

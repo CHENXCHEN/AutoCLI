@@ -1,4 +1,6 @@
-use autocli_core::{ArgDef, ArgType, CliCommand, CliError, NavigateBefore, Strategy};
+use autocli_core::{
+    ArgDef, ArgType, BrowserOptions, CliCommand, CliError, NavigateBefore, Strategy,
+};
 use serde_json::Value;
 
 /// Parse a YAML adapter file content into a CliCommand.
@@ -31,9 +33,7 @@ pub fn parse_yaml_adapter(content: &str) -> Result<CliCommand, CliError> {
 
     // Parse strategy (default: public)
     let strategy = match raw.get("strategy").and_then(|v| v.as_str()) {
-        Some(s) => {
-            serde_json::from_value(Value::String(s.to_string())).unwrap_or(Strategy::Public)
-        }
+        Some(s) => serde_json::from_value(Value::String(s.to_string())).unwrap_or(Strategy::Public),
         None => Strategy::Public,
     };
 
@@ -52,10 +52,9 @@ pub fn parse_yaml_adapter(content: &str) -> Result<CliCommand, CliError> {
         .unwrap_or_default();
 
     // Pipeline is stored as-is (Vec<Value>)
-    let pipeline = raw
-        .get("pipeline")
-        .and_then(|v| v.as_array())
-        .cloned();
+    let pipeline = raw.get("pipeline").and_then(|v| v.as_array()).cloned();
+
+    let (browser, browser_options) = parse_browser_config(&raw, strategy.requires_browser())?;
 
     Ok(CliCommand {
         site,
@@ -65,15 +64,10 @@ pub fn parse_yaml_adapter(content: &str) -> Result<CliCommand, CliError> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        domain: raw
-            .get("domain")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        domain: raw.get("domain").and_then(|v| v.as_str()).map(String::from),
         strategy,
-        browser: raw
-            .get("browser")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(strategy.requires_browser()),
+        browser,
+        browser_options,
         args,
         columns,
         pipeline,
@@ -81,6 +75,76 @@ pub fn parse_yaml_adapter(content: &str) -> Result<CliCommand, CliError> {
         timeout_seconds: raw.get("timeoutSeconds").and_then(|v| v.as_u64()),
         navigate_before: NavigateBefore::default(),
     })
+}
+
+fn parse_browser_config(
+    raw: &Value,
+    strategy_requires_browser: bool,
+) -> Result<(bool, Option<BrowserOptions>), CliError> {
+    let Some(browser) = raw.get("browser") else {
+        return Ok((strategy_requires_browser, None));
+    };
+
+    if let Some(enabled) = browser.as_bool() {
+        return Ok((enabled, None));
+    }
+
+    let Some(obj) = browser.as_object() else {
+        return Err(CliError::AdapterLoad {
+            message: "browser must be a boolean or an object".into(),
+            suggestions: vec![],
+            source: None,
+        });
+    };
+
+    let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    if !enabled {
+        return Ok((false, None));
+    }
+
+    let group_idle_timeout_seconds =
+        match obj.get("groupIdleTimeoutSeconds") {
+            Some(Value::Number(n)) => {
+                Some(n.as_u64().filter(|value| *value > 0).ok_or_else(|| {
+                    CliError::AdapterLoad {
+                        message: "browser.groupIdleTimeoutSeconds must be a positive integer"
+                            .into(),
+                        suggestions: vec![],
+                        source: None,
+                    }
+                })?)
+            }
+            Some(Value::String(s)) => {
+                Some(s.trim().parse::<u64>().map_err(|_| CliError::AdapterLoad {
+                    message: "browser.groupIdleTimeoutSeconds must be a positive integer".into(),
+                    suggestions: vec![],
+                    source: None,
+                })?)
+            }
+            Some(_) => {
+                return Err(CliError::AdapterLoad {
+                    message: "browser.groupIdleTimeoutSeconds must be a positive integer".into(),
+                    suggestions: vec![],
+                    source: None,
+                });
+            }
+            None => None,
+        };
+
+    Ok((
+        true,
+        Some(BrowserOptions {
+            carrier: obj
+                .get("carrier")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            group_name: obj
+                .get("groupName")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            group_idle_timeout_seconds,
+        }),
+    ))
 }
 
 /// Parse args from YAML map format to Vec<ArgDef>
@@ -157,6 +221,7 @@ pipeline:
         assert_eq!(cmd.name, "top");
         assert_eq!(cmd.strategy, Strategy::Public);
         assert!(!cmd.browser);
+        assert_eq!(cmd.browser_options, None);
         assert_eq!(cmd.args.len(), 1);
         assert_eq!(cmd.args[0].name, "limit");
         assert_eq!(cmd.args[0].arg_type, ArgType::Int);
@@ -178,6 +243,40 @@ domain: www.bilibili.com
         assert_eq!(cmd.strategy, Strategy::Cookie);
         assert!(cmd.browser); // cookie strategy implies browser
         assert_eq!(cmd.domain, Some("www.bilibili.com".to_string()));
+    }
+
+    #[test]
+    fn test_parse_browser_object_config() {
+        let yaml = r#"
+site: example
+name: read
+description: Read with background group
+strategy: public
+browser:
+  carrier: tab-group-background
+  groupName: work
+  groupIdleTimeoutSeconds: 30
+"#;
+        let cmd = parse_yaml_adapter(yaml).unwrap();
+        assert!(cmd.browser);
+        let options = cmd.browser_options.unwrap();
+        assert_eq!(options.carrier.as_deref(), Some("tab-group-background"));
+        assert_eq!(options.group_name.as_deref(), Some("work"));
+        assert_eq!(options.group_idle_timeout_seconds, Some(30));
+    }
+
+    #[test]
+    fn test_browser_object_can_disable_browser() {
+        let yaml = r#"
+site: example
+name: public
+description: Public command
+browser:
+  enabled: false
+"#;
+        let cmd = parse_yaml_adapter(yaml).unwrap();
+        assert!(!cmd.browser);
+        assert_eq!(cmd.browser_options, None);
     }
 
     #[test]

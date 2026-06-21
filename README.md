@@ -121,6 +121,43 @@ Simply re-run the install command or download the latest release to overwrite th
 
 > Public mode commands (hackernews, devto, lobsters, etc.) work without the extension.
 
+### Optional: Chrome Tab Group Strict Background Mode
+
+Browser commands still use the existing automation window by default. To avoid creating a new visible Chrome window, explicitly enable Tab Group strict background mode:
+
+```json
+{
+  "browser": {
+    "carrier": "tab-group-background",
+    "groupName": "work",
+    "groupIdleTimeoutSeconds": 30
+  }
+}
+```
+
+Environment variables can override the file config:
+
+```bash
+AUTOCLI_BROWSER_CARRIER=tab-group-background
+AUTOCLI_BROWSER_GROUP_NAME=work
+AUTOCLI_BROWSER_GROUP_IDLE_TIMEOUT=30
+```
+
+The actual group title is `AutoCLI-${groupName}`; an exact-title Tab Group is reused. If `groupName` is omitted or blank, it defaults to `default`, producing `AutoCLI-default`. This mode strictly avoids new visible Chrome windows, avoids switching to AutoCLI tabs, and avoids stealing the current active tab. If Chrome, the extension, or an existing normal Chrome window is unavailable, the command fails instead of falling back to a new window or an activated tab. `tabs select` is unsupported in this mode.
+
+After a command ends, the same group is kept briefly for consecutive commands. When it becomes idle, AutoCLI removes only tabs it created in that group. To roll back, unset these environment variables or set `carrier` back to `automation-window`.
+
+Custom local adapters can also choose the browser carrier per command, overriding global config and environment variables:
+
+```yaml
+browser:
+  carrier: tab-group-background
+  groupName: work
+  groupIdleTimeoutSeconds: 30
+```
+
+The existing `browser: true` / `browser: false` syntax remains compatible. If an adapter or global config explicitly selects `tab-group-background` without a valid `groupName`, AutoCLI uses `default`.
+
 ## Skill Install
 
 One-click install autocli skill for your AI Agent:

@@ -30,6 +30,13 @@ impl Default for NavigateBefore {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserOptions {
+    pub carrier: Option<String>,
+    pub group_name: Option<String>,
+    pub group_idle_timeout_seconds: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct CliCommand {
     pub site: String,
@@ -38,6 +45,7 @@ pub struct CliCommand {
     pub domain: Option<String>,
     pub strategy: Strategy,
     pub browser: bool,
+    pub browser_options: Option<BrowserOptions>,
     pub args: Vec<ArgDef>,
     pub columns: Vec<String>,
     pub pipeline: Option<Vec<Value>>,
@@ -58,8 +66,16 @@ impl CliCommand {
         // Check if pipeline contains browser steps
         if let Some(ref pipeline) = self.pipeline {
             const BROWSER_STEPS: &[&str] = &[
-                "navigate", "click", "type", "wait", "press",
-                "evaluate", "snapshot", "screenshot", "intercept", "tap",
+                "navigate",
+                "click",
+                "type",
+                "wait",
+                "press",
+                "evaluate",
+                "snapshot",
+                "screenshot",
+                "intercept",
+                "tap",
             ];
             for step in pipeline {
                 if let Some(obj) = step.as_object() {

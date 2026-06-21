@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::config::{BrowserCarrier, BrowserConfig};
 use crate::daemon_client::DaemonClient;
 use crate::dom_helpers;
 use crate::types::{DaemonCommand, ReadArticle};
@@ -15,6 +16,7 @@ use crate::types::{DaemonCommand, ReadArticle};
 pub struct DaemonPage {
     client: Arc<DaemonClient>,
     workspace: String,
+    browser_config: BrowserConfig,
     tab_id: RwLock<Option<u64>>,
 }
 
@@ -23,6 +25,20 @@ impl DaemonPage {
         Self {
             client,
             workspace: workspace.into(),
+            browser_config: BrowserConfig::default(),
+            tab_id: RwLock::new(None),
+        }
+    }
+
+    pub fn new_with_browser_config(
+        client: Arc<DaemonClient>,
+        workspace: impl Into<String>,
+        browser_config: BrowserConfig,
+    ) -> Self {
+        Self {
+            client,
+            workspace: workspace.into(),
+            browser_config,
             tab_id: RwLock::new(None),
         }
     }
@@ -30,6 +46,18 @@ impl DaemonPage {
     /// Build a command with workspace and optional tab_id pre-filled.
     async fn cmd(&self, action: &str) -> DaemonCommand {
         let mut c = DaemonCommand::new(action).with_workspace(self.workspace.clone());
+        c = c.with_carrier(self.browser_config.carrier.as_str());
+        if matches!(
+            self.browser_config.carrier,
+            BrowserCarrier::TabGroupBackground
+        ) {
+            if let Some(group_name) = &self.browser_config.group_name {
+                c = c.with_group_name(group_name.clone());
+            }
+            if let Some(timeout) = self.browser_config.group_idle_timeout_seconds {
+                c = c.with_group_idle_timeout_seconds(timeout);
+            }
+        }
         if let Some(tid) = *self.tab_id.read().await {
             c = c.with_tab_id(tid);
         }
@@ -54,9 +82,8 @@ impl DaemonPage {
     pub async fn read_article(&self, url: &str) -> Result<ReadArticle, CliError> {
         let cmd = self.cmd("read-article").await.with_url(url);
         let val = self.send(cmd).await?;
-        serde_json::from_value::<ReadArticle>(val).map_err(|e| {
-            CliError::argument(format!("Failed to parse article payload: {e}"))
-        })
+        serde_json::from_value::<ReadArticle>(val)
+            .map_err(|e| CliError::argument(format!("Failed to parse article payload: {e}")))
     }
 }
 
@@ -164,8 +191,7 @@ impl IPage for DaemonPage {
 
     async fn snapshot(&self, options: Option<SnapshotOptions>) -> Result<Value, CliError> {
         let opts = options.unwrap_or_default();
-        let js =
-            dom_helpers::snapshot_js(opts.selector.as_deref(), opts.include_hidden);
+        let js = dom_helpers::snapshot_js(opts.selector.as_deref(), opts.include_hidden);
         self.eval_js(&js).await
     }
 
@@ -256,7 +282,10 @@ pub(crate) fn base64_decode_simple(input: &str) -> Vec<u8> {
     }
     let _ = TABLE; // suppress unused warning
 
-    let bytes: Vec<u8> = input.bytes().filter(|&b| b != b'=' && b != b'\n' && b != b'\r').collect();
+    let bytes: Vec<u8> = input
+        .bytes()
+        .filter(|&b| b != b'=' && b != b'\n' && b != b'\r')
+        .collect();
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
     for chunk in bytes.chunks(4) {
         let n = chunk.len();

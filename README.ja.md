@@ -121,6 +121,43 @@ cp target/release/autocli /usr/local/bin/   # macOS / Linux
 
 > Public モードのコマンド（hackernews、devto、lobsters など）は拡張機能なしで使用できます。
 
+### 任意: Chrome Tab Group 厳格バックグラウンドモード
+
+ブラウザコマンドは、デフォルトでは従来どおり automation window を使用します。新しい可視 Chrome ウィンドウを作りたくない場合は、Tab Group 厳格バックグラウンドモードを明示的に有効化できます。
+
+```json
+{
+  "browser": {
+    "carrier": "tab-group-background",
+    "groupName": "work",
+    "groupIdleTimeoutSeconds": 30
+  }
+}
+```
+
+環境変数でも上書きできます。
+
+```bash
+AUTOCLI_BROWSER_CARRIER=tab-group-background
+AUTOCLI_BROWSER_GROUP_NAME=work
+AUTOCLI_BROWSER_GROUP_IDLE_TIMEOUT=30
+```
+
+実際のグループ名は `AutoCLI-${groupName}` になり、完全一致する Tab Group があれば再利用します。`groupName` が未指定または空白の場合は `default` になり、`AutoCLI-default` を使用します。このモードでは、新しい可視 Chrome ウィンドウを作らず、AutoCLI タブへ切り替えず、現在のアクティブタブを奪いません。Chrome、拡張機能、または既存の通常 Chrome ウィンドウが利用できない場合は、新規ウィンドウやアクティブ化へのフォールバックをせず、明示的に失敗します。`tabs select` はこのモードでは使用できません。
+
+コマンド終了後は、連続コマンドのために同じグループを短時間保持します。アイドルタイムアウト後は、そのグループ内で AutoCLI が作成したタブだけを削除します。元に戻すには、これらの環境変数を削除するか、`carrier` を `automation-window` に戻してください。
+
+カスタムローカル adapter でも、コマンドごとにブラウザ carrier を指定できます。この設定はグローバル設定と環境変数を上書きします。
+
+```yaml
+browser:
+  carrier: tab-group-background
+  groupName: work
+  groupIdleTimeoutSeconds: 30
+```
+
+既存の `browser: true` / `browser: false` 構文は引き続き互換です。adapter またはグローバル設定で `tab-group-background` を明示的に選び、有効な `groupName` がない場合は `default` を使用します。
+
 ## Skill インストール
 
 ワンクリックで AI Agent に autocli skill をインストール：

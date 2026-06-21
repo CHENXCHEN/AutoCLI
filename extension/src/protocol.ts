@@ -8,6 +8,7 @@
  */
 
 export type Action = 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'sessions' | 'set-file-input' | 'cdp' | 'read-article';
+export type BrowserCarrier = 'automation-window' | 'tab-group-background';
 
 export interface Command {
   /** Unique request ID */
@@ -20,6 +21,12 @@ export interface Command {
   code?: string;
   /** Logical workspace for automation session reuse */
   workspace?: string;
+  /** Browser carrier mode. Defaults to automation-window for protocol compatibility. */
+  carrier?: BrowserCarrier;
+  /** User configured group suffix. Effective title is AutoCLI-${groupName}. */
+  groupName?: string;
+  /** Idle cleanup timeout for strict background group sessions. */
+  groupIdleTimeoutSeconds?: number;
   /** URL to navigate to (navigate action) */
   url?: string;
   /** Sub-operation for tabs: list, new, close, select */
