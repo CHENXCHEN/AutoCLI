@@ -157,6 +157,7 @@ type TabGroupSession = {
 
 const automationSessions = new Map<string, AutomationSession>();
 const tabGroupSessions = new Map<string, TabGroupSession>();
+const tabGroupSessionLocks = new Map<string, Promise<TabGroupSession>>();
 const WINDOW_IDLE_TIMEOUT = 30000; // 30s — quick cleanup after command finishes
 
 function getWorkspaceKey(workspace?: string): string {
@@ -463,17 +464,25 @@ async function getHostWindowId(): Promise<number> {
   return host.id;
 }
 
-async function getTabGroupSession(workspace: string, cmd: Command): Promise<TabGroupSession> {
-  const title = getGroupTitle(cmd);
-  const key = getTabGroupSessionKey(workspace, title);
+async function getExistingTabGroupSession(key: string): Promise<TabGroupSession | null> {
   const existing = tabGroupSessions.get(key);
   if (existing) {
     try {
       await chrome.tabGroups.get(existing.groupId);
       return existing;
     } catch {
+      if (existing.idleTimer) clearTimeout(existing.idleTimer);
       tabGroupSessions.delete(key);
     }
+  }
+  return null;
+}
+
+async function createTabGroupSession(workspace: string, title: string, key: string, cmd: Command): Promise<TabGroupSession> {
+  const existing = await getExistingTabGroupSession(key);
+  if (existing) {
+    resetTabGroupIdleTimer(workspace, cmd);
+    return existing;
   }
 
   const exactGroups = (await chrome.tabGroups.query({ title }))
@@ -514,6 +523,33 @@ async function getTabGroupSession(workspace: string, cmd: Command): Promise<TabG
   tabGroupSessions.set(key, session);
   resetTabGroupIdleTimer(workspace, cmd);
   return session;
+}
+
+async function getTabGroupSession(workspace: string, cmd: Command): Promise<TabGroupSession> {
+  const title = getGroupTitle(cmd);
+  const key = getTabGroupSessionKey(workspace, title);
+  const existing = await getExistingTabGroupSession(key);
+  if (existing) {
+    resetTabGroupIdleTimer(workspace, cmd);
+    return existing;
+  }
+
+  const pending = tabGroupSessionLocks.get(key);
+  if (pending) {
+    const session = await pending;
+    resetTabGroupIdleTimer(workspace, cmd);
+    return session;
+  }
+
+  const creation = createTabGroupSession(workspace, title, key, cmd);
+  tabGroupSessionLocks.set(key, creation);
+  try {
+    return await creation;
+  } finally {
+    if (tabGroupSessionLocks.get(key) === creation) {
+      tabGroupSessionLocks.delete(key);
+    }
+  }
 }
 
 async function resolveTabGroupTab(tabId: number | undefined, workspace: string, cmd: Command, initialUrl?: string): Promise<ResolvedTab> {

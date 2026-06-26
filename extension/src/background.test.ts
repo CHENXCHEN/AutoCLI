@@ -389,4 +389,95 @@ describe('background tab isolation', () => {
     expect(result.data).toEqual({ released: true });
     expect(chrome.windows.remove).not.toHaveBeenCalled();
   });
+
+  it('shares one strict-background tab group for concurrent commands with the same workspace and group', async () => {
+    vi.useFakeTimers();
+    try {
+      const { chrome, tabs, groups } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+
+      const mod = await import('./background');
+      const first = mod.__test__.handleTabs({
+        id: '15',
+        action: 'tabs',
+        op: 'new',
+        url: 'https://first.example',
+        workspace: 'site:twitter',
+        carrier: 'tab-group-background',
+        groupName: 'work',
+        groupIdleTimeoutSeconds: 1,
+      }, 'site:twitter');
+      const second = mod.__test__.handleTabs({
+        id: '16',
+        action: 'tabs',
+        op: 'new',
+        url: 'https://second.example',
+        workspace: 'site:twitter',
+        carrier: 'tab-group-background',
+        groupName: 'work',
+        groupIdleTimeoutSeconds: 1,
+      }, 'site:twitter');
+
+      const results = await Promise.all([first, second]);
+
+      expect(results.every((result) => result.ok)).toBe(true);
+      expect(chrome.windows.create).not.toHaveBeenCalled();
+      const autocliGroups = groups.filter((group) => group.title === 'AutoCLI-work');
+      expect(autocliGroups).toHaveLength(1);
+      const groupTabs = tabs.filter((tab) => tab.groupId === autocliGroups[0].id);
+      expect(groupTabs.map((tab) => tab.url).sort()).toEqual([
+        'about:blank',
+        'https://first.example',
+        'https://second.example',
+      ]);
+
+      const release = await mod.__test__.handleCloseWindow({
+        id: '17',
+        action: 'close-window',
+        workspace: 'site:twitter',
+        carrier: 'tab-group-background',
+        groupName: 'work',
+        groupIdleTimeoutSeconds: 1,
+      }, 'site:twitter');
+      expect(release.ok).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(tabs.some((tab) => tab.groupId === autocliGroups[0].id)).toBe(false);
+      expect(chrome.windows.remove).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps strict-background session locks scoped by group name', async () => {
+    const { chrome, groups } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    const results = await Promise.all([
+      mod.__test__.handleTabs({
+        id: '18',
+        action: 'tabs',
+        op: 'new',
+        url: 'https://work.example',
+        workspace: 'site:twitter',
+        carrier: 'tab-group-background',
+        groupName: 'work',
+      }, 'site:twitter'),
+      mod.__test__.handleTabs({
+        id: '19',
+        action: 'tabs',
+        op: 'new',
+        url: 'https://dev.example',
+        workspace: 'site:twitter',
+        carrier: 'tab-group-background',
+        groupName: 'dev',
+      }, 'site:twitter'),
+    ]);
+
+    expect(results.every((result) => result.ok)).toBe(true);
+    expect(groups.filter((group) => group.title === 'AutoCLI-work')).toHaveLength(1);
+    expect(groups.filter((group) => group.title === 'AutoCLI-dev')).toHaveLength(1);
+  });
 });
