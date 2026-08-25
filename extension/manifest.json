@@ -10,6 +10,7 @@
     "cookies",
     "activeTab",
     "alarms",
+    "storage",
     "tabGroups"
   ],
   "host_permissions": [

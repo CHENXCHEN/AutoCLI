@@ -2,6 +2,7 @@ use autocli_core::{BrowserOptions, CliError, IPage};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::config::{load_browser_config_with_options, BrowserCarrier, BrowserConfig};
 use crate::daemon_client::DaemonClient;
@@ -20,6 +21,7 @@ pub struct BrowserBridge {
     port: u16,
     browser_config: Option<BrowserConfig>,
     browser_options: Option<BrowserOptions>,
+    strict_background_workspace: String,
 }
 
 impl BrowserBridge {
@@ -28,6 +30,7 @@ impl BrowserBridge {
             port,
             browser_config: None,
             browser_options: None,
+            strict_background_workspace: Uuid::new_v4().to_string(),
         }
     }
 
@@ -36,6 +39,7 @@ impl BrowserBridge {
             port,
             browser_config: Some(browser_config),
             browser_options: None,
+            strict_background_workspace: Uuid::new_v4().to_string(),
         }
     }
 
@@ -54,6 +58,13 @@ impl BrowserBridge {
             self.browser_config.as_ref().map(|cfg| &cfg.carrier),
             Some(BrowserCarrier::TabGroupBackground)
         )
+    }
+
+    fn workspace_for(&self, browser_config: &BrowserConfig) -> &str {
+        match browser_config.carrier {
+            BrowserCarrier::TabGroupBackground => &self.strict_background_workspace,
+            BrowserCarrier::AutomationWindow => "default",
+        }
     }
 
     /// Connect to the daemon, starting it if necessary, and return a trait-object page.
@@ -95,7 +106,7 @@ impl BrowserBridge {
         {
             return Ok(Arc::new(DaemonPage::new_with_browser_config(
                 client,
-                "default",
+                self.workspace_for(&browser_config),
                 browser_config.clone(),
             )));
         }
@@ -124,7 +135,7 @@ impl BrowserBridge {
         {
             return Ok(Arc::new(DaemonPage::new_with_browser_config(
                 client,
-                "default",
+                self.workspace_for(&browser_config),
                 browser_config.clone(),
             )));
         }
@@ -328,5 +339,25 @@ mod tests {
     fn automation_window_keeps_chrome_wake_path() {
         let bridge = BrowserBridge::new(19925);
         assert!(bridge.should_wake_chrome_for_extension_recovery());
+    }
+
+    #[test]
+    fn tab_group_background_uses_a_unique_stable_workspace() {
+        let config = BrowserConfig {
+            carrier: BrowserCarrier::TabGroupBackground,
+            group_name: Some("work".to_string()),
+            group_idle_timeout_seconds: Some(30),
+        };
+        let first = BrowserBridge::with_browser_config(19925, config.clone());
+        let second = BrowserBridge::with_browser_config(19925, config.clone());
+
+        assert_eq!(first.workspace_for(&config), first.workspace_for(&config));
+        assert_ne!(first.workspace_for(&config), second.workspace_for(&config));
+    }
+
+    #[test]
+    fn automation_window_uses_default_workspace() {
+        let bridge = BrowserBridge::new(19925);
+        assert_eq!(bridge.workspace_for(&BrowserConfig::default()), "default");
     }
 }

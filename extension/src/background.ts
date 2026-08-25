@@ -151,14 +151,56 @@ type TabGroupSession = {
   windowId: number;
   title: string;
   ownedTabIds: Set<number>;
+  // A group is global, but each logical caller needs a stable default tab in
+  // that shared group. This map never grants ownership by itself: every value
+  // must also be present in ownedTabIds before it can be used.
+  workspaceTabIds: Map<string, number>;
+  // Every AutoCLI-created tab has one logical owner. The physical Chrome tab
+  // group is shared by title, but ownership is never inferred from membership.
+  tabWorkspaceOwners: Map<number, string>;
+  // Activity is tracked per owned tab. Chrome's Tab.lastAccessed only changes
+  // when a tab becomes active, which strict background tabs intentionally do
+  // not do, so this records successful AutoCLI operations instead.
+  tabActivities: Map<number, TabGroupTabActivity>;
+  leaseId: string;
   idleTimer: ReturnType<typeof setTimeout> | null;
+  // This is the scheduler's earliest per-tab expiry, not a group-wide last
+  // activity time. It is retained for storage compatibility with prior builds.
+  idleDeadlineAt: number;
+};
+
+type TabGroupTabActivity = {
+  lastOperationAt: number;
+  expiresAt: number;
+};
+
+type StoredTabGroupSession = {
+  groupId: number;
+  windowId: number;
+  title: string;
+  ownedTabIds: number[];
+  workspaceTabIds?: Array<[string, number]>;
+  tabWorkspaceOwners?: Array<[number, string]>;
+  tabActivities?: Array<[number, TabGroupTabActivity]>;
+  leaseId?: string;
   idleDeadlineAt: number;
 };
 
 const automationSessions = new Map<string, AutomationSession>();
 const tabGroupSessions = new Map<string, TabGroupSession>();
 const tabGroupSessionLocks = new Map<string, Promise<TabGroupSession>>();
+const tabGroupSessionMutations = new Map<string, Promise<void>>();
+const tabGroupSessionStorageWrites = new Map<string, Promise<void>>();
+const tabGroupCleanupLeases = new Map<string, Promise<void>>();
+const tabGroupActivityGenerations = new Map<string, number>();
+const tabGroupActiveCommandCounts = new Map<string, number>();
 const WINDOW_IDLE_TIMEOUT = 30000; // 30s — quick cleanup after command finishes
+const TAB_GROUP_SESSION_STORAGE_PREFIX = 'autocli.tabGroupSession.';
+const TAB_GROUP_CLEANUP_ALARM_PREFIX = 'autocli-tab-group-cleanup:';
+const TAB_GROUP_ORPHAN_TAB_CLOSE_ALARM_PREFIX = 'autocli-tab-group-orphan-tab:';
+const TAB_GROUP_CLEANUP_RETRY_DELAY = 30_000;
+const TAB_GROUP_RESTORE_RETRY_ALARM = 'autocli-tab-group-restore';
+const TAB_GROUP_STORAGE_RETRY_ATTEMPTS = 3;
 
 function getWorkspaceKey(workspace?: string): string {
   return workspace?.trim() || 'default';
@@ -183,8 +225,260 @@ function getGroupTitle(cmd: Command): string {
   return `AutoCLI-${name}`;
 }
 
-function getTabGroupSessionKey(workspace: string, title: string): string {
-  return `${workspace}\n${title}`;
+function getTabGroupSessionKey(title: string): string {
+  // Tab Groups are global to the Chrome profile, so their session identity must
+  // match the user-visible title rather than the daemon's legacy workspace.
+  return title;
+}
+
+function getTabGroupSessionStorageKey(key: string): string {
+  return `${TAB_GROUP_SESSION_STORAGE_PREFIX}${encodeURIComponent(key)}`;
+}
+
+function getTabGroupCleanupAlarmName(key: string): string {
+  return `${TAB_GROUP_CLEANUP_ALARM_PREFIX}${encodeURIComponent(key)}`;
+}
+
+function getTabGroupOrphanTabCloseAlarmName(key: string, leaseId: string, groupId: number, tabId: number): string {
+  return `${TAB_GROUP_ORPHAN_TAB_CLOSE_ALARM_PREFIX}${encodeURIComponent(key)}:${leaseId}:${groupId}:${tabId}`;
+}
+
+function getTabGroupSessionKeyFromAlarmName(name: string): string | null {
+  if (!name.startsWith(TAB_GROUP_CLEANUP_ALARM_PREFIX)) return null;
+  try {
+    return decodeURIComponent(name.slice(TAB_GROUP_CLEANUP_ALARM_PREFIX.length));
+  } catch {
+    return null;
+  }
+}
+
+function getTabGroupOrphanTabCloseAlarm(name: string): { key: string; leaseId: string; groupId: number; tabId: number } | null {
+  if (!name.startsWith(TAB_GROUP_ORPHAN_TAB_CLOSE_ALARM_PREFIX)) return null;
+  const encoded = name.slice(TAB_GROUP_ORPHAN_TAB_CLOSE_ALARM_PREFIX.length);
+  const tabSeparator = encoded.lastIndexOf(':');
+  const groupSeparator = encoded.lastIndexOf(':', tabSeparator - 1);
+  const leaseSeparator = encoded.lastIndexOf(':', groupSeparator - 1);
+  if (leaseSeparator < 1 || groupSeparator <= leaseSeparator + 1 || tabSeparator <= groupSeparator + 1) return null;
+  const leaseId = encoded.slice(leaseSeparator + 1, groupSeparator);
+  const groupId = Number(encoded.slice(groupSeparator + 1, tabSeparator));
+  const tabId = Number(encoded.slice(tabSeparator + 1));
+  if (!leaseId || !Number.isInteger(groupId) || groupId < 0 || !Number.isInteger(tabId) || tabId < 0) return null;
+  try {
+    return { key: decodeURIComponent(encoded.slice(0, leaseSeparator)), leaseId, groupId, tabId };
+  } catch {
+    return null;
+  }
+}
+
+function beginTabGroupActivity(key: string): void {
+  tabGroupActivityGenerations.set(key, (tabGroupActivityGenerations.get(key) ?? 0) + 1);
+}
+
+function beginTabGroupCommand(key: string): void {
+  beginTabGroupActivity(key);
+  tabGroupActiveCommandCounts.set(key, (tabGroupActiveCommandCounts.get(key) ?? 0) + 1);
+}
+
+function endTabGroupCommand(key: string): void {
+  const count = tabGroupActiveCommandCounts.get(key) ?? 0;
+  if (count <= 1) {
+    tabGroupActiveCommandCounts.delete(key);
+  } else {
+    tabGroupActiveCommandCounts.set(key, count - 1);
+  }
+}
+
+function isTabGroupCommandActive(key: string): boolean {
+  return (tabGroupActiveCommandCounts.get(key) ?? 0) > 0;
+}
+
+function isTabGroupActivityCurrent(key: string, generation: number): boolean {
+  return (tabGroupActivityGenerations.get(key) ?? 0) === generation;
+}
+
+function createTabGroupSessionLeaseId(): string {
+  return crypto.randomUUID();
+}
+
+function hasValidWorkspaceTabBindings(value: unknown): value is Array<[string, number]> {
+  if (!Array.isArray(value)) return false;
+  const workspaces = new Set<string>();
+  return value.every((entry) => {
+    if (!Array.isArray(entry) || entry.length !== 2) return false;
+    const [workspace, tabId] = entry;
+    if (typeof workspace !== 'string' || !workspace || !Number.isInteger(tabId) || tabId < 0) return false;
+    if (workspaces.has(workspace)) return false;
+    workspaces.add(workspace);
+    return true;
+  });
+}
+
+function hasValidTabWorkspaceOwners(value: unknown): value is Array<[number, string]> {
+  if (!Array.isArray(value)) return false;
+  const tabIds = new Set<number>();
+  return value.every((entry) => {
+    if (!Array.isArray(entry) || entry.length !== 2) return false;
+    const [tabId, workspace] = entry;
+    if (!Number.isInteger(tabId) || tabId < 0 || typeof workspace !== 'string' || !workspace) return false;
+    if (tabIds.has(tabId)) return false;
+    tabIds.add(tabId);
+    return true;
+  });
+}
+
+function hasValidTabActivities(value: unknown): value is Array<[number, TabGroupTabActivity]> {
+  if (!Array.isArray(value)) return false;
+  const tabIds = new Set<number>();
+  return value.every((entry) => {
+    if (!Array.isArray(entry) || entry.length !== 2) return false;
+    const [tabId, activity] = entry;
+    if (!Number.isInteger(tabId) || tabId < 0 || !activity || typeof activity !== 'object') return false;
+    const { lastOperationAt, expiresAt } = activity as Partial<TabGroupTabActivity>;
+    if (
+      typeof lastOperationAt !== 'number'
+      || typeof expiresAt !== 'number'
+      || !Number.isFinite(lastOperationAt)
+      || !Number.isFinite(expiresAt)
+      || expiresAt < lastOperationAt
+    ) return false;
+    if (tabIds.has(tabId)) return false;
+    tabIds.add(tabId);
+    return true;
+  });
+}
+
+function serializeTabGroupSession(session: TabGroupSession): StoredTabGroupSession {
+  return {
+    groupId: session.groupId,
+    windowId: session.windowId,
+    title: session.title,
+    ownedTabIds: [...session.ownedTabIds],
+    workspaceTabIds: [...session.workspaceTabIds.entries()],
+    tabWorkspaceOwners: [...session.tabWorkspaceOwners.entries()],
+    tabActivities: [...session.tabActivities.entries()].map(([tabId, activity]) => [tabId, { ...activity }]),
+    leaseId: session.leaseId,
+    idleDeadlineAt: session.idleDeadlineAt,
+  };
+}
+
+function isStoredTabGroupSession(value: unknown): value is StoredTabGroupSession {
+  if (!value || typeof value !== 'object') return false;
+  const session = value as Partial<StoredTabGroupSession>;
+  return Number.isInteger(session.groupId)
+    && Number.isInteger(session.windowId)
+    && typeof session.title === 'string'
+    && Array.isArray(session.ownedTabIds)
+    && session.ownedTabIds.every((tabId) => Number.isInteger(tabId))
+    && (session.workspaceTabIds === undefined || hasValidWorkspaceTabBindings(session.workspaceTabIds))
+    && (session.tabWorkspaceOwners === undefined || hasValidTabWorkspaceOwners(session.tabWorkspaceOwners))
+    && (session.tabActivities === undefined || hasValidTabActivities(session.tabActivities))
+    && (session.leaseId === undefined || (typeof session.leaseId === 'string' && session.leaseId.length > 0))
+    && Number.isFinite(session.idleDeadlineAt);
+}
+
+function enqueueTabGroupSessionStorageWrite<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = tabGroupSessionStorageWrites.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(operation);
+  const settled = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  tabGroupSessionStorageWrites.set(key, settled);
+  void settled.then(() => {
+    if (tabGroupSessionStorageWrites.get(key) === settled) tabGroupSessionStorageWrites.delete(key);
+  });
+  return next;
+}
+
+function enqueueTabGroupSessionMutation<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = tabGroupSessionMutations.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(operation);
+  const settled = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  tabGroupSessionMutations.set(key, settled);
+  void settled.then(() => {
+    if (tabGroupSessionMutations.get(key) === settled) tabGroupSessionMutations.delete(key);
+  });
+  return next;
+}
+
+function withTabGroupCleanupLease<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = tabGroupCleanupLeases.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(operation);
+  const settled = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  tabGroupCleanupLeases.set(key, settled);
+  void settled.then(() => {
+    if (tabGroupCleanupLeases.get(key) === settled) tabGroupCleanupLeases.delete(key);
+  });
+  return next;
+}
+
+async function waitForTabGroupCleanupLease(key: string): Promise<void> {
+  const pending = tabGroupCleanupLeases.get(key);
+  if (pending) await pending;
+}
+
+async function retryTabGroupStorageOperation<T>(operation: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < TAB_GROUP_STORAGE_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      // Let Chrome finish a transient internal storage operation before retrying.
+      if (attempt + 1 < TAB_GROUP_STORAGE_RETRY_ATTEMPTS) await Promise.resolve();
+    }
+  }
+  throw lastError;
+}
+
+function persistTabGroupSession(key: string, session: TabGroupSession): Promise<void> {
+  return enqueueTabGroupSessionStorageWrite(key, async () => {
+    if (tabGroupSessions.get(key) !== session) return;
+    await retryTabGroupStorageOperation(() => chrome.storage.session.set({
+      [getTabGroupSessionStorageKey(key)]: serializeTabGroupSession(session),
+    }));
+  });
+}
+
+type PersistedTabGroupSessionRemoval = 'removed' | 'missing' | 'replaced';
+
+function removePersistedTabGroupSession(
+  key: string,
+  leaseId: string,
+): Promise<PersistedTabGroupSessionRemoval> {
+  return enqueueTabGroupSessionStorageWrite(key, async () => {
+    const storageKey = getTabGroupSessionStorageKey(key);
+    const current = (await retryTabGroupStorageOperation(() => chrome.storage.session.get(storageKey)))[storageKey];
+    if (current === undefined) return 'missing';
+    if (!isStoredTabGroupSession(current) || current.leaseId !== leaseId) return 'replaced';
+    await retryTabGroupStorageOperation(() => chrome.storage.session.remove(storageKey));
+    return 'removed';
+  });
+}
+
+async function readPersistedTabGroupSession(key: string): Promise<StoredTabGroupSession | null> {
+  const storageKey = getTabGroupSessionStorageKey(key);
+  const stored = (await retryTabGroupStorageOperation(() => chrome.storage.session.get(storageKey)))[storageKey];
+  return isStoredTabGroupSession(stored) ? stored : null;
+}
+
+async function removeStoredTabGroupRecordIfStillInvalid(storageKey: string, key?: string): Promise<void> {
+  await enqueueTabGroupSessionStorageWrite(key ?? storageKey, async () => {
+    const current = (await retryTabGroupStorageOperation(() => chrome.storage.session.get(storageKey)))[storageKey];
+    const isCurrentRecordValid = key !== undefined
+      && isStoredTabGroupSession(current)
+      && current.title === key
+      && isCanonicalTabGroupSessionKey(key);
+    if (current !== undefined && !isCurrentRecordValid) {
+      await retryTabGroupStorageOperation(() => chrome.storage.session.remove(storageKey));
+    }
+  });
 }
 
 function getTabGroupIdleTimeout(cmd: Command): number {
@@ -218,35 +512,132 @@ function resetWindowIdleTimer(workspace: string): void {
   }, WINDOW_IDLE_TIMEOUT);
 }
 
-function resetTabGroupIdleTimer(workspace: string, cmd: Command): void {
-  if (!isTabGroupCarrier(cmd)) return;
-  let title: string;
+function armTabGroupCleanup(key: string, session: TabGroupSession, deadlineAt: number): void {
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  session.idleDeadlineAt = deadlineAt;
+  chrome.alarms.create(getTabGroupCleanupAlarmName(key), { when: deadlineAt });
+  session.idleTimer = setTimeout(() => {
+    void cleanupTabGroupSession(key, deadlineAt);
+  }, Math.max(0, deadlineAt - Date.now()));
+}
+
+function getNextTabGroupCleanupDeadline(session: TabGroupSession): number | null {
+  let nextDeadlineAt: number | null = null;
+  for (const tabId of session.ownedTabIds) {
+    const deadlineAt = session.tabActivities.get(tabId)?.expiresAt;
+    if (deadlineAt === undefined) continue;
+    if (nextDeadlineAt === null || deadlineAt < nextDeadlineAt) nextDeadlineAt = deadlineAt;
+  }
+  return nextDeadlineAt;
+}
+
+function armTabGroupCleanupForOwnedTabs(key: string, session: TabGroupSession): number | null {
+  const nextDeadlineAt = getNextTabGroupCleanupDeadline(session);
+  if (nextDeadlineAt !== null) armTabGroupCleanup(key, session, nextDeadlineAt);
+  return nextDeadlineAt;
+}
+
+function recordTabGroupTabActivity(session: TabGroupSession, tabId: number, cmd: Command): void {
+  const lastOperationAt = Date.now();
+  session.tabActivities.set(tabId, {
+    lastOperationAt,
+    expiresAt: lastOperationAt + getTabGroupIdleTimeout(cmd),
+  });
+}
+
+function scheduleTabGroupCleanupRetry(key: string, session?: TabGroupSession): void {
+  const retryAt = Date.now() + TAB_GROUP_CLEANUP_RETRY_DELAY;
+  chrome.alarms.create(getTabGroupCleanupAlarmName(key), { when: retryAt });
+  if (!session) return;
+
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  session.idleTimer = setTimeout(() => {
+    void cleanupTabGroupSession(key);
+  }, Math.max(0, retryAt - Date.now()));
+}
+
+function scheduleOrphanTabClose(
+  key: string,
+  session: Pick<TabGroupSession, 'leaseId' | 'groupId'>,
+  tabId: number,
+): void {
+  chrome.alarms.create(getTabGroupOrphanTabCloseAlarmName(key, session.leaseId, session.groupId, tabId), {
+    when: Date.now() + TAB_GROUP_CLEANUP_RETRY_DELAY,
+  });
+}
+
+async function clearOrphanTabCloseAlarm(alarmName: string): Promise<void> {
   try {
-    title = getGroupTitle(cmd);
+    await chrome.alarms.clear(alarmName);
   } catch {
+    // The one-shot alarm may already be gone.
+  }
+}
+
+async function closeOrphanedTab(key: string, leaseId: string, groupId: number, tabId: number): Promise<void> {
+  const alarmName = getTabGroupOrphanTabCloseAlarmName(key, leaseId, groupId, tabId);
+  let stored: StoredTabGroupSession | null;
+  try {
+    stored = await readPersistedTabGroupSession(key);
+  } catch {
+    // No durable ownership proof means the alarm cannot safely delete a tab.
+    await clearOrphanTabCloseAlarm(alarmName);
     return;
   }
-  const key = getTabGroupSessionKey(workspace, title);
-  const session = tabGroupSessions.get(key);
-  if (!session) return;
-  if (session.idleTimer) clearTimeout(session.idleTimer);
-  const timeout = getTabGroupIdleTimeout(cmd);
-  session.idleDeadlineAt = Date.now() + timeout;
-  session.idleTimer = setTimeout(async () => {
-    const current = tabGroupSessions.get(key);
-    if (!current) return;
-    const ownedTabIds = [...current.ownedTabIds];
-    if (ownedTabIds.length > 0) {
-      try {
-        await chrome.tabs.remove(ownedTabIds);
-      } catch {
-        // Some or all tabs may already be gone.
-      }
-    }
-    current.ownedTabIds.clear();
-    tabGroupSessions.delete(key);
-    console.log(`[autocli] Tab group ${current.title} (${workspace}) released (idle timeout)`);
-  }, timeout);
+  if (
+    !stored
+    || stored.leaseId !== leaseId
+    || stored.groupId !== groupId
+    || !stored.ownedTabIds.includes(tabId)
+    || !stored.tabWorkspaceOwners?.some(([ownedTabId]) => ownedTabId === tabId)
+  ) {
+    await clearOrphanTabCloseAlarm(alarmName);
+    return;
+  }
+  let tab: chrome.tabs.Tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    await clearOrphanTabCloseAlarm(alarmName);
+    return;
+  }
+  if (tab.groupId !== groupId) {
+    await clearOrphanTabCloseAlarm(alarmName);
+    return;
+  }
+
+  let groupState: TabGroupSessionState;
+  try {
+    groupState = await getTabGroupSessionState({
+      groupId,
+      windowId: tab.windowId,
+      title: key,
+      ownedTabIds: new Set([tabId]),
+      workspaceTabIds: new Map(),
+      tabWorkspaceOwners: new Map(),
+      tabActivities: new Map(),
+      leaseId: '',
+      idleTimer: null,
+      idleDeadlineAt: 0,
+    });
+  } catch {
+    groupState = 'unavailable';
+  }
+  if (groupState === 'missing') {
+    await clearOrphanTabCloseAlarm(alarmName);
+    return;
+  }
+  if (groupState === 'unavailable') {
+    await clearOrphanTabCloseAlarm(alarmName);
+    return;
+  }
+
+  try {
+    await chrome.tabs.remove(tabId);
+    await clearOrphanTabCloseAlarm(alarmName);
+  } catch {
+    scheduleOrphanTabClose(key, { groupId, leaseId }, tabId);
+  }
 }
 
 /** Get or create the dedicated automation window.
@@ -321,6 +712,27 @@ chrome.windows.onRemoved.addListener((windowId) => {
   }
 });
 
+// Keep the ownership ledger small when a user or Chrome closes one of our
+// tabs before the next command or idle cleanup reconciliation runs.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  for (const [key, session] of tabGroupSessions.entries()) {
+    if (!session.ownedTabIds.has(tabId)) continue;
+    void enqueueTabGroupSessionMutation(key, async () => {
+      if (tabGroupSessions.get(key) !== session || !session.ownedTabIds.delete(tabId)) return;
+      removeTabGroupTabMetadata(session, tabId);
+      const nextDeadlineAt = armTabGroupCleanupForOwnedTabs(key, session);
+      if (nextDeadlineAt === null) armTabGroupCleanup(key, session, Date.now());
+      try {
+        await persistTabGroupSession(key, session);
+      } catch {
+        // A later command or cleanup reconciliation retries without inferring
+        // ownership from the other tabs in the group.
+        scheduleTabGroupCleanupRetry(key, session);
+      }
+    });
+  }
+});
+
 // ─── Lifecycle events ────────────────────────────────────────────────
 
 let initialized = false;
@@ -343,8 +755,24 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'keepalive') void connect();
+  if (alarm.name === 'keepalive') {
+    void connect();
+    return;
+  }
+  if (alarm.name === TAB_GROUP_RESTORE_RETRY_ALARM) {
+    void restoreTabGroupCleanupAlarms();
+    return;
+  }
+  const orphanTab = getTabGroupOrphanTabCloseAlarm(alarm.name);
+  if (orphanTab) {
+    void closeOrphanedTab(orphanTab.key, orphanTab.leaseId, orphanTab.groupId, orphanTab.tabId);
+    return;
+  }
+  const sessionKey = getTabGroupSessionKeyFromAlarmName(alarm.name);
+  if (sessionKey) void cleanupTabGroupSession(sessionKey);
 });
+
+void restoreTabGroupCleanupAlarms();
 
 // ─── Popup status API ───────────────────────────────────────────────
 
@@ -362,12 +790,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 async function handleCommand(cmd: Command): Promise<Result> {
   const workspace = getWorkspaceKey(cmd.workspace);
+  let tabGroupActivityKey: string | undefined;
   try {
     validateStrictBackgroundCommand(cmd);
 
-    // Reset idle timer on every command (window/group stays alive while active).
-    if (isTabGroupCarrier(cmd)) resetTabGroupIdleTimer(workspace, cmd);
-    else resetWindowIdleTimer(workspace);
+    // Strict-background cleanup is still fenced per group while a command runs,
+    // but timestamps are updated only for the tab that the command actually
+    // operates on. A list or another workspace's command must not extend every
+    // tab in the shared physical group.
+    if (isTabGroupCarrier(cmd)) {
+      // This synchronous fence is visible to an in-flight cleanup before it can
+      // issue the next tabs.remove call, even while renewal is queued behind it.
+      tabGroupActivityKey = getTabGroupSessionKey(getGroupTitle(cmd));
+      beginTabGroupCommand(tabGroupActivityKey);
+      // A cleanup that already submitted chrome.tabs.remove cannot be cancelled.
+      // Wait for that same-title cleanup to finish before resolving a tab, so a
+      // later command never starts using a tab Chrome is concurrently deleting.
+      await waitForTabGroupCleanupLease(tabGroupActivityKey);
+      // Enforce the title's single-group invariant for every strict command,
+      // including read-only list and close-window paths that do not create a
+      // session themselves.
+      await findUniqueTabGroupsByTitle(getGroupTitle(cmd));
+    } else {
+      resetWindowIdleTimer(workspace);
+    }
 
     switch (cmd.action) {
       case 'exec':
@@ -399,6 +845,14 @@ async function handleCommand(cmd: Command): Promise<Result> {
       ok: false,
       error: err instanceof Error ? err.message : String(err),
     };
+  } finally {
+    if (tabGroupActivityKey) {
+      endTabGroupCommand(tabGroupActivityKey);
+      // An alarm may have fired while this command held the cleanup fence. Run
+      // the per-tab expiry sweep once the command releases it instead of
+      // renewing unrelated tabs in the same group.
+      cleanupExpiredTabGroupTabsAfterCommand(tabGroupActivityKey);
+    }
   }
 }
 
@@ -464,29 +918,666 @@ async function getHostWindowId(): Promise<number> {
   return host.id;
 }
 
-async function getExistingTabGroupSession(key: string): Promise<TabGroupSession | null> {
-  const existing = tabGroupSessions.get(key);
-  if (existing) {
-    try {
-      await chrome.tabGroups.get(existing.groupId);
-      return existing;
-    } catch {
-      if (existing.idleTimer) clearTimeout(existing.idleTimer);
-      tabGroupSessions.delete(key);
-    }
-  }
-  return null;
+type TabGroupSessionState = 'live' | 'missing' | 'unavailable';
+
+function isCanonicalTabGroupSessionKey(key: string): boolean {
+  return key.startsWith('AutoCLI-') && !key.includes('\n') && !key.includes('\r');
 }
 
-async function createTabGroupSession(workspace: string, title: string, key: string, cmd: Command): Promise<TabGroupSession> {
-  const existing = await getExistingTabGroupSession(key);
+function isCurrentTabGroupCleanup(key: string, session: TabGroupSession, deadlineAt: number): boolean {
+  return tabGroupSessions.get(key) === session && session.idleDeadlineAt === deadlineAt;
+}
+
+function isCurrentTabGroupCleanupAttempt(
+  key: string,
+  session: TabGroupSession,
+  deadlineAt: number,
+  activityGeneration: number,
+): boolean {
+  return isCurrentTabGroupCleanup(key, session, deadlineAt)
+    && isTabGroupActivityCurrent(key, activityGeneration)
+    && !isTabGroupCommandActive(key);
+}
+
+function getLiveOwnedTabIds(tabs: chrome.tabs.Tab[], ownedTabIds: Set<number>): number[] {
+  return tabs
+    .map((tab) => tab.id)
+    .filter((tabId): tabId is number => tabId !== undefined && ownedTabIds.has(tabId));
+}
+
+function removeWorkspaceTabBindingsForTab(session: TabGroupSession, tabId: number): boolean {
+  let changed = false;
+  for (const [workspace, boundTabId] of session.workspaceTabIds.entries()) {
+    if (boundTabId !== tabId) continue;
+    session.workspaceTabIds.delete(workspace);
+    changed = true;
+  }
+  return changed;
+}
+
+function removeTabWorkspaceOwner(session: TabGroupSession, tabId: number): boolean {
+  const removed = session.tabWorkspaceOwners.delete(tabId);
+  return removeWorkspaceTabBindingsForTab(session, tabId) || removed;
+}
+
+function removeTabGroupTabMetadata(session: TabGroupSession, tabId: number): boolean {
+  const removedActivity = session.tabActivities.delete(tabId);
+  return removeTabWorkspaceOwner(session, tabId) || removedActivity;
+}
+
+function createLegacyTabActivity(expiresAt: number): TabGroupTabActivity {
+  // Older records only had a group-level deadline. Preserve that deadline as
+  // the migration boundary instead of inventing a newer last-operation time.
+  return { lastOperationAt: expiresAt, expiresAt };
+}
+
+function ensureOwnedTabActivities(session: TabGroupSession): boolean {
+  let changed = false;
+  for (const tabId of session.ownedTabIds) {
+    if (session.tabActivities.has(tabId)) continue;
+    session.tabActivities.set(tabId, createLegacyTabActivity(session.idleDeadlineAt));
+    changed = true;
+  }
+  for (const tabId of session.tabActivities.keys()) {
+    if (session.ownedTabIds.has(tabId)) continue;
+    session.tabActivities.delete(tabId);
+    changed = true;
+  }
+  return changed;
+}
+
+function pruneWorkspaceTabBindings(session: TabGroupSession, liveOwnedTabIds: Set<number>): boolean {
+  let changed = false;
+  for (const [workspace, tabId] of session.workspaceTabIds.entries()) {
+    if (liveOwnedTabIds.has(tabId)) continue;
+    session.workspaceTabIds.delete(workspace);
+    changed = true;
+  }
+  return changed;
+}
+
+function pruneTabWorkspaceOwners(session: TabGroupSession, liveOwnedTabIds: Set<number>): boolean {
+  let changed = false;
+  for (const tabId of session.tabWorkspaceOwners.keys()) {
+    if (liveOwnedTabIds.has(tabId)) continue;
+    session.tabWorkspaceOwners.delete(tabId);
+    changed = true;
+  }
+  return changed;
+}
+
+function pruneTabActivities(session: TabGroupSession, liveOwnedTabIds: Set<number>): boolean {
+  let changed = false;
+  for (const tabId of session.tabActivities.keys()) {
+    if (liveOwnedTabIds.has(tabId)) continue;
+    session.tabActivities.delete(tabId);
+    changed = true;
+  }
+  return changed;
+}
+
+async function getTabGroupSessionState(session: TabGroupSession): Promise<TabGroupSessionState> {
+  try {
+    const group = await chrome.tabGroups.get(session.groupId);
+    return group.title === session.title ? 'live' : 'missing';
+  } catch {
+    try {
+      const groups = await chrome.tabGroups.query({ title: session.title });
+      return groups.some((group) => group.id === session.groupId && group.title === session.title)
+        ? 'live'
+        : 'missing';
+    } catch {
+      return 'unavailable';
+    }
+  }
+}
+
+async function reconcileTabGroupSession(key: string, session: TabGroupSession): Promise<TabGroupSessionState> {
+  const groupState = await getTabGroupSessionState(session);
+  if (groupState !== 'live') return groupState;
+
+  const knownOwnedTabIds = new Set(session.ownedTabIds);
+  let groupTabs: chrome.tabs.Tab[];
+  try {
+    groupTabs = await chrome.tabs.query({ groupId: session.groupId });
+  } catch {
+    return 'unavailable';
+  }
+
+  const liveOwnedTabIds = new Set(getLiveOwnedTabIds(groupTabs, knownOwnedTabIds));
+  const staleOwnedTabIds = [...knownOwnedTabIds].filter((tabId) => !liveOwnedTabIds.has(tabId));
+  const prunedWorkspaceBindings = pruneWorkspaceTabBindings(session, liveOwnedTabIds);
+  const prunedTabOwners = pruneTabWorkspaceOwners(session, liveOwnedTabIds);
+  const prunedTabActivities = pruneTabActivities(session, liveOwnedTabIds);
+  if (staleOwnedTabIds.length > 0) {
+    for (const tabId of staleOwnedTabIds) session.ownedTabIds.delete(tabId);
+  }
+  const restoredMissingActivities = ensureOwnedTabActivities(session);
+  const nextDeadlineAt = getNextTabGroupCleanupDeadline(session);
+  const deadlineChanged = nextDeadlineAt !== null && nextDeadlineAt !== session.idleDeadlineAt;
+  if (deadlineChanged && nextDeadlineAt !== null) {
+    armTabGroupCleanup(key, session, nextDeadlineAt);
+  }
+  if (
+    staleOwnedTabIds.length > 0
+    || prunedWorkspaceBindings
+    || prunedTabOwners
+    || prunedTabActivities
+    || restoredMissingActivities
+    || deadlineChanged
+  ) {
+    await persistTabGroupSession(key, session);
+  }
+  return 'live';
+}
+
+async function retryTabGroupCleanup(
+  key: string,
+  session: TabGroupSession,
+  expectedDeadlineAt?: number,
+): Promise<void> {
+  if (expectedDeadlineAt !== undefined && !isCurrentTabGroupCleanup(key, session, expectedDeadlineAt)) return;
+  // A retry does not change the durable deadline. A storage outage must not
+  // turn into an untracked session or grant cleanup permission over user tabs.
+  scheduleTabGroupCleanupRetry(key, session);
+  console.warn(`[autocli] Retrying cleanup of tab group ${session.title}`);
+}
+
+async function restoreTabGroupSessionAfterDiscardRace(
+  key: string,
+  session: TabGroupSession,
+): Promise<void> {
+  if (tabGroupSessions.get(key) !== session) return;
+  try {
+    await persistTabGroupSession(key, session);
+  } catch {
+    scheduleTabGroupCleanupRetry(key, session);
+    return;
+  }
+  if (tabGroupSessions.get(key) !== session) return;
+
+  const nextDeadlineAt = getNextTabGroupCleanupDeadline(session);
+  if (nextDeadlineAt !== null && nextDeadlineAt > Date.now()) {
+    armTabGroupCleanup(key, session, nextDeadlineAt);
+  } else {
+    scheduleTabGroupCleanupRetry(key, session);
+  }
+}
+
+async function discardTabGroupSession(
+  key: string,
+  session?: TabGroupSession,
+  expectedDeadlineAt?: number,
+  expectedActivityGeneration?: number,
+): Promise<boolean> {
+  const activityChanged = (): boolean => expectedActivityGeneration !== undefined
+    && !isTabGroupActivityCurrent(key, expectedActivityGeneration);
+  const current = tabGroupSessions.get(key);
+  if (!session) return false;
+  if (session && current !== session) return false;
+  if (expectedDeadlineAt !== undefined && (!session || !isCurrentTabGroupCleanup(key, session, expectedDeadlineAt))) {
+    return false;
+  }
+  if (activityChanged()) return false;
+  if (current?.idleTimer) {
+    clearTimeout(current.idleTimer);
+    current.idleTimer = null;
+  }
+
+  try {
+    const removal = await removePersistedTabGroupSession(key, session.leaseId);
+    if (removal === 'replaced') {
+      if (tabGroupSessions.get(key) === session) await restoreTabGroupSessionAfterDiscardRace(key, session);
+      return false;
+    }
+  } catch {
+    if (activityChanged()) return false;
+    if (session && tabGroupSessions.get(key) === session) {
+      await retryTabGroupCleanup(key, session, expectedDeadlineAt);
+    }
+    return false;
+  }
+
+  if (activityChanged()) {
+    if (session) await restoreTabGroupSessionAfterDiscardRace(key, session);
+    return false;
+  }
+  if (session && tabGroupSessions.get(key) !== session) return false;
+  if (expectedDeadlineAt !== undefined && (!session || !isCurrentTabGroupCleanup(key, session, expectedDeadlineAt))) {
+    return false;
+  }
+
+  try {
+    await chrome.alarms.clear(getTabGroupCleanupAlarmName(key));
+  } catch {
+    // The alarm may already be gone.
+  }
+
+  if (activityChanged()) {
+    if (session) await restoreTabGroupSessionAfterDiscardRace(key, session);
+    return false;
+  }
+  if (session && tabGroupSessions.get(key) !== session) return false;
+  if (expectedDeadlineAt !== undefined && (!session || !isCurrentTabGroupCleanup(key, session, expectedDeadlineAt))) {
+    const latest = tabGroupSessions.get(key);
+    if (latest) armTabGroupCleanupForOwnedTabs(key, latest);
+    return false;
+  }
+
+  if (tabGroupSessions.get(key) === session) {
+    tabGroupSessions.delete(key);
+    tabGroupActivityGenerations.delete(key);
+  }
+  return true;
+}
+
+async function getExistingTabGroupSession(
+  key: string,
+  expectedActivityGeneration?: number,
+): Promise<TabGroupSession | null> {
+  const existing = tabGroupSessions.get(key);
   if (existing) {
-    resetTabGroupIdleTimer(workspace, cmd);
+    const state = await reconcileTabGroupSession(key, existing);
+    if (state === 'missing') {
+      await discardTabGroupSession(key, existing, existing.idleDeadlineAt, expectedActivityGeneration);
+      return null;
+    }
     return existing;
   }
 
+  const stored = await readPersistedTabGroupSession(key);
+  if (!stored || stored.title !== key || !isCanonicalTabGroupSessionKey(key)) return null;
+
+  const concurrent = tabGroupSessions.get(key);
+  if (concurrent) return concurrent;
+  const restored: TabGroupSession = {
+    groupId: stored.groupId,
+    windowId: stored.windowId,
+    title: stored.title,
+    ownedTabIds: new Set(stored.ownedTabIds),
+    workspaceTabIds: new Map(stored.workspaceTabIds ?? []),
+    // Older ledgers cannot establish a safe owner for their tabs. Leave them
+    // unowned rather than adopting them from the shared group.
+    tabWorkspaceOwners: new Map(stored.tabWorkspaceOwners ?? []),
+    tabActivities: new Map(stored.tabActivities ?? stored.ownedTabIds.map((tabId) => [
+      tabId,
+      createLegacyTabActivity(stored.idleDeadlineAt),
+    ])),
+    leaseId: stored.leaseId ?? createTabGroupSessionLeaseId(),
+    idleTimer: null,
+    idleDeadlineAt: stored.idleDeadlineAt,
+  };
+  tabGroupSessions.set(key, restored);
+
+  const state = await reconcileTabGroupSession(key, restored);
+  if (state === 'missing') {
+    await discardTabGroupSession(key, restored, restored.idleDeadlineAt, expectedActivityGeneration);
+    return null;
+  }
+  if (
+    stored.workspaceTabIds === undefined
+    || stored.tabWorkspaceOwners === undefined
+    || stored.tabActivities === undefined
+    || stored.leaseId === undefined
+  ) {
+    await persistTabGroupSession(key, restored);
+  }
+  return restored;
+}
+
+async function touchTabGroupTab(cmd: Command, workspace: string, tabId: number): Promise<void> {
+  if (!isTabGroupCarrier(cmd)) return;
+  const key = getTabGroupSessionKey(getGroupTitle(cmd));
+  await enqueueTabGroupSessionMutation(key, async () => {
+    const session = tabGroupSessions.get(key) ?? await getExistingTabGroupSession(key);
+    if (
+      !session
+      || !session.ownedTabIds.has(tabId)
+      || session.tabWorkspaceOwners.get(tabId) !== workspace
+    ) {
+      throw new Error(`strict-background-stale-tab: Tab ${tabId} is no longer owned by workspace ${workspace}`);
+    }
+
+    const previousDeadlineAt = session.idleDeadlineAt;
+    const previousActivity = session.tabActivities.get(tabId);
+    recordTabGroupTabActivity(session, tabId, cmd);
+    beginTabGroupActivity(key);
+    armTabGroupCleanupForOwnedTabs(key, session);
+    try {
+      await persistTabGroupSession(key, session);
+    } catch (error) {
+      if (previousActivity) {
+        session.tabActivities.set(tabId, previousActivity);
+      } else {
+        session.tabActivities.delete(tabId);
+      }
+      armTabGroupCleanup(key, session, previousDeadlineAt);
+      throw error;
+    }
+  });
+}
+
+async function touchWorkspaceTabOnStrictBackgroundRelease(cmd: Command, workspace: string): Promise<void> {
+  const key = getTabGroupSessionKey(getGroupTitle(cmd));
+  const session = await getExistingTabGroupSession(key);
+  if (!session) return;
+  const tabId = cmd.tabId ?? session.workspaceTabIds.get(workspace);
+  if (tabId === undefined || session.tabWorkspaceOwners.get(tabId) !== workspace) return;
+  await touchTabGroupTab(cmd, workspace, tabId);
+}
+
+function cleanupExpiredTabGroupTabsAfterCommand(key: string): void {
+  const session = tabGroupSessions.get(key);
+  if (!session) return;
+  const nextDeadlineAt = getNextTabGroupCleanupDeadline(session);
+  if (nextDeadlineAt === null) return;
+  if (nextDeadlineAt <= Date.now()) {
+    void cleanupTabGroupSession(key);
+  } else {
+    armTabGroupCleanup(key, session, nextDeadlineAt);
+  }
+}
+
+async function cleanupTabGroupSession(key: string, expectedDeadlineAt?: number): Promise<void> {
+  return withTabGroupCleanupLease(key, () => cleanupTabGroupSessionLocked(key, expectedDeadlineAt));
+}
+
+async function cleanupTabGroupSessionLocked(key: string, expectedDeadlineAt?: number): Promise<void> {
+  const activityGeneration = tabGroupActivityGenerations.get(key) ?? 0;
+  if (isTabGroupCommandActive(key)) {
+    const activeSession = tabGroupSessions.get(key);
+    if (activeSession) scheduleTabGroupCleanupRetry(key, activeSession);
+    return;
+  }
+  let current: TabGroupSession | null;
+  try {
+    current = await getExistingTabGroupSession(key, activityGeneration);
+  } catch {
+    scheduleTabGroupCleanupRetry(key, tabGroupSessions.get(key));
+    return;
+  }
+  if (!isTabGroupActivityCurrent(key, activityGeneration)) {
+    if (isTabGroupCommandActive(key) && current) scheduleTabGroupCleanupRetry(key, current);
+    return;
+  }
+  if (!current) {
+    try {
+      await chrome.alarms.clear(getTabGroupCleanupAlarmName(key));
+    } catch {
+      // The alarm may already be gone.
+    }
+    return;
+  }
+
+  const deadlineAt = current.idleDeadlineAt;
+  if (expectedDeadlineAt !== undefined && expectedDeadlineAt !== deadlineAt) return;
+  if (!isCurrentTabGroupCleanupAttempt(key, current, deadlineAt, activityGeneration)) return;
+  if (Date.now() < deadlineAt) {
+    armTabGroupCleanup(key, current, deadlineAt);
+    try {
+      await persistTabGroupSession(key, current);
+    } catch {
+      // The existing durable deadline is unchanged, and the alarm remains armed.
+    }
+    return;
+  }
+
+  let state: TabGroupSessionState;
+  try {
+    state = await reconcileTabGroupSession(key, current);
+  } catch {
+    if (!isCurrentTabGroupCleanupAttempt(key, current, deadlineAt, activityGeneration)) return;
+    await retryTabGroupCleanup(key, current, deadlineAt);
+    return;
+  }
+  if (!isCurrentTabGroupCleanupAttempt(key, current, deadlineAt, activityGeneration)) return;
+  if (state === 'missing') {
+    await discardTabGroupSession(key, current, deadlineAt, activityGeneration);
+    return;
+  }
+  if (state === 'unavailable') {
+    await retryTabGroupCleanup(key, current, deadlineAt);
+    return;
+  }
+  if (!isCurrentTabGroupCleanup(key, current, deadlineAt)) return;
+
+  if (current.ownedTabIds.size === 0) {
+    if (await discardTabGroupSession(key, current, deadlineAt, activityGeneration)) {
+      console.log(`[autocli] Tab group ${current.title} released (no owned tabs)`);
+    }
+    return;
+  }
+
+  let groupTabs: chrome.tabs.Tab[];
+  try {
+    groupTabs = await chrome.tabs.query({ groupId: current.groupId });
+  } catch {
+    if (!isCurrentTabGroupCleanupAttempt(key, current, deadlineAt, activityGeneration)) return;
+    await retryTabGroupCleanup(key, current, deadlineAt);
+    return;
+  }
+  if (!isCurrentTabGroupCleanupAttempt(key, current, deadlineAt, activityGeneration)) return;
+
+  const now = Date.now();
+  const expiredTabIds = getLiveOwnedTabIds(groupTabs, current.ownedTabIds)
+    .filter((tabId) => current!.tabActivities.get(tabId)?.expiresAt !== undefined
+      && current!.tabActivities.get(tabId)!.expiresAt <= now);
+
+  if (expiredTabIds.length === 0) {
+    // An old alarm can race a per-tab touch or stale-ledger reconciliation.
+    // Recompute from the individual tab deadlines instead of deleting a tab
+    // merely because the previous group-level scheduler deadline elapsed.
+    const nextDeadlineAt = armTabGroupCleanupForOwnedTabs(key, current);
+    if (nextDeadlineAt !== null) {
+      try {
+        await persistTabGroupSession(key, current);
+      } catch {
+        await retryTabGroupCleanup(key, current, deadlineAt);
+      }
+    }
+    return;
+  }
+
+  for (const tabId of expiredTabIds) {
+    if (!isCurrentTabGroupCleanupAttempt(key, current, deadlineAt, activityGeneration)) return;
+    try {
+      // Recheck membership immediately before removal. A user may have moved
+      // this tab out of the group after the group query; in that case the
+      // following reconciliation only drops the AutoCLI ledger entry.
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.groupId !== current.groupId) continue;
+      await chrome.tabs.remove(tabId);
+    } catch {
+      // The tab may have been closed after the live-tab query.
+    }
+  }
+
+  let remainingState: TabGroupSessionState;
+  try {
+    remainingState = await reconcileTabGroupSession(key, current);
+  } catch {
+    if (!isCurrentTabGroupCleanupAttempt(key, current, deadlineAt, activityGeneration)) return;
+    await retryTabGroupCleanup(key, current, deadlineAt);
+    return;
+  }
+  if (!isCurrentTabGroupCleanupAttempt(key, current, deadlineAt, activityGeneration)) return;
+  if (remainingState === 'missing') {
+    await discardTabGroupSession(key, current, deadlineAt, activityGeneration);
+    return;
+  }
+  if (remainingState === 'unavailable') {
+    await retryTabGroupCleanup(key, current, deadlineAt);
+    return;
+  }
+  if (!isCurrentTabGroupCleanupAttempt(key, current, deadlineAt, activityGeneration)) return;
+
+  if (current.ownedTabIds.size > 0) {
+    const nextDeadlineAt = getNextTabGroupCleanupDeadline(current);
+    if (nextDeadlineAt !== null && nextDeadlineAt > Date.now()) {
+      armTabGroupCleanup(key, current, nextDeadlineAt);
+      try {
+        await persistTabGroupSession(key, current);
+      } catch {
+        await retryTabGroupCleanup(key, current, deadlineAt);
+      }
+    } else {
+      await retryTabGroupCleanup(key, current, deadlineAt);
+    }
+    return;
+  }
+
+  if (await discardTabGroupSession(key, current, deadlineAt, activityGeneration)) {
+    console.log(`[autocli] Tab group ${current.title} released (idle timeout)`);
+  }
+}
+
+async function restoreTabGroupCleanupAlarms(): Promise<void> {
+  try {
+    const records = await retryTabGroupStorageOperation(() => chrome.storage.session.get());
+    for (const [storageKey, value] of Object.entries(records)) {
+      if (!storageKey.startsWith(TAB_GROUP_SESSION_STORAGE_PREFIX)) continue;
+      let key: string;
+      try {
+        key = decodeURIComponent(storageKey.slice(TAB_GROUP_SESSION_STORAGE_PREFIX.length));
+      } catch {
+        await removeStoredTabGroupRecordIfStillInvalid(storageKey);
+        continue;
+      }
+      if (!isStoredTabGroupSession(value) || value.title !== key || !isCanonicalTabGroupSessionKey(key)) {
+        await removeStoredTabGroupRecordIfStillInvalid(storageKey, key);
+        continue;
+      }
+
+      const session = await getExistingTabGroupSession(key);
+      if (!session) continue;
+      if (session.idleDeadlineAt <= Date.now()) {
+        void cleanupTabGroupSession(key);
+      } else {
+        armTabGroupCleanup(key, session, session.idleDeadlineAt);
+      }
+    }
+  } catch {
+    // Storage can be temporarily unavailable while Chrome starts the extension.
+    chrome.alarms.create(TAB_GROUP_RESTORE_RETRY_ALARM, {
+      when: Date.now() + TAB_GROUP_CLEANUP_RETRY_DELAY,
+    });
+  }
+}
+
+async function abandonUnpersistedTabGroupSession(key: string, session: TabGroupSession): Promise<void> {
+  if (tabGroupSessions.get(key) !== session) return;
+  if (session.idleTimer) {
+    clearTimeout(session.idleTimer);
+    session.idleTimer = null;
+  }
+  tabGroupSessions.delete(key);
+  tabGroupActivityGenerations.delete(key);
+  try {
+    await chrome.alarms.clear(getTabGroupCleanupAlarmName(key));
+  } catch {
+    // The alarm may already be gone.
+  }
+  try {
+    await removePersistedTabGroupSession(key, session.leaseId);
+  } catch {
+    // If a failed set actually reached Chrome, a later reconciliation removes
+    // the stale ID after this command's created tab has been closed.
+  }
+}
+
+async function rollbackNewOwnedTabRegistration(
+  key: string,
+  session: TabGroupSession,
+  tabId: number,
+): Promise<void> {
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch {
+    // Retain the ID when the tab cannot be closed. A retry alarm is only safe
+    // after the failed tab's ownership has been durably recorded.
+    try {
+      await persistTabGroupSession(key, session);
+      scheduleOrphanTabClose(key, session, tabId);
+    } catch {
+      // The command still fails; we never infer ownership from group membership.
+    }
+    return;
+  }
+
+  session.ownedTabIds.delete(tabId);
+  removeTabGroupTabMetadata(session, tabId);
+  const nextDeadlineAt = armTabGroupCleanupForOwnedTabs(key, session);
+  if (nextDeadlineAt === null) armTabGroupCleanup(key, session, Date.now());
+  try {
+    await persistTabGroupSession(key, session);
+  } catch {
+    // A stale stored ID is harmless: reconciliation only removes IDs that were
+    // already recorded as AutoCLI-owned and are no longer in the live group.
+  }
+}
+
+async function registerNewOwnedTab(
+  key: string,
+  session: TabGroupSession,
+  tabId: number,
+  cmd: Command,
+  workspace?: string,
+): Promise<void> {
+  await enqueueTabGroupSessionMutation(key, async () => {
+    if (tabGroupSessions.get(key) !== session) {
+      try {
+        await chrome.tabs.remove(tabId);
+      } catch {
+        // No current session can authorize a cross-restart retry here.
+      }
+      throw new Error(`strict-background group ${session.title} was released before the new tab could be registered`);
+    }
+
+    session.ownedTabIds.add(tabId);
+    if (workspace) {
+      session.workspaceTabIds.set(workspace, tabId);
+      session.tabWorkspaceOwners.set(tabId, workspace);
+    }
+    const previousDeadlineAt = session.idleDeadlineAt;
+    const previousActivity = session.tabActivities.get(tabId);
+    recordTabGroupTabActivity(session, tabId, cmd);
+    beginTabGroupActivity(key);
+    armTabGroupCleanupForOwnedTabs(key, session);
+    try {
+      await persistTabGroupSession(key, session);
+    } catch (error) {
+      if (previousActivity) {
+        session.tabActivities.set(tabId, previousActivity);
+      } else {
+        session.tabActivities.delete(tabId);
+      }
+      armTabGroupCleanup(key, session, previousDeadlineAt);
+      await rollbackNewOwnedTabRegistration(key, session, tabId);
+      throw error;
+    }
+  });
+}
+
+async function findUniqueTabGroupsByTitle(title: string) {
   const exactGroups = (await chrome.tabGroups.query({ title }))
     .filter((group) => group.id !== undefined && group.title === title);
+  if (exactGroups.length > 1) {
+    throw new Error(
+      `strict-background found multiple open tab groups named ${title}; refusing to choose one`,
+    );
+  }
+  return exactGroups;
+}
+
+async function createTabGroupSession(title: string, key: string, cmd: Command): Promise<TabGroupSession> {
+  const existing = await getExistingTabGroupSession(key);
+  if (existing) {
+    await findUniqueTabGroupsByTitle(title);
+    armTabGroupCleanupForOwnedTabs(key, existing);
+    return existing;
+  }
+
+  const exactGroups = await findUniqueTabGroupsByTitle(title);
   const reusable = exactGroups[0];
   if (reusable?.id !== undefined) {
     const groupTabs = await chrome.tabs.query({ groupId: reusable.id });
@@ -499,49 +1590,90 @@ async function createTabGroupSession(workspace: string, title: string, key: stri
       windowId,
       title,
       ownedTabIds: new Set(),
+      workspaceTabIds: new Map(),
+      tabWorkspaceOwners: new Map(),
+      tabActivities: new Map(),
+      leaseId: createTabGroupSessionLeaseId(),
       idleTimer: null,
       idleDeadlineAt: Date.now() + getTabGroupIdleTimeout(cmd),
     };
     tabGroupSessions.set(key, session);
-    resetTabGroupIdleTimer(workspace, cmd);
+    try {
+      armTabGroupCleanup(key, session, session.idleDeadlineAt);
+      await persistTabGroupSession(key, session);
+    } catch (error) {
+      await abandonUnpersistedTabGroupSession(key, session);
+      throw error;
+    }
     return session;
   }
 
   const windowId = await getHostWindowId();
   const seedTab = await chrome.tabs.create({ windowId, url: BLANK_PAGE, active: false });
   if (!seedTab.id) throw new Error('Failed to create strict-background seed tab');
-  const groupId = await chrome.tabs.group({ tabIds: [seedTab.id] });
-  await chrome.tabGroups.update(groupId, { title, color: 'blue', collapsed: true });
-  const session: TabGroupSession = {
-    groupId,
-    windowId,
-    title,
-    ownedTabIds: new Set([seedTab.id]),
-    idleTimer: null,
-    idleDeadlineAt: Date.now() + getTabGroupIdleTimeout(cmd),
-  };
-  tabGroupSessions.set(key, session);
-  resetTabGroupIdleTimer(workspace, cmd);
-  return session;
+  let groupId: number | undefined;
+  let session: TabGroupSession | undefined;
+  try {
+    groupId = await chrome.tabs.group({ tabIds: [seedTab.id] });
+    await chrome.tabGroups.update(groupId, { title, color: 'blue', collapsed: true });
+    const confirmedGroups = await findUniqueTabGroupsByTitle(title);
+    if (!confirmedGroups.some((group) => group.id === groupId)) {
+      throw new Error(`strict-background group ${title} disappeared while it was being created`);
+    }
+    const lastOperationAt = Date.now();
+    session = {
+      groupId,
+      windowId,
+      title,
+      ownedTabIds: new Set([seedTab.id]),
+      workspaceTabIds: new Map([[getWorkspaceKey(cmd.workspace), seedTab.id]]),
+      tabWorkspaceOwners: new Map([[seedTab.id, getWorkspaceKey(cmd.workspace)]]),
+      tabActivities: new Map([[seedTab.id, {
+        lastOperationAt,
+        expiresAt: lastOperationAt + getTabGroupIdleTimeout(cmd),
+      }]]),
+      leaseId: createTabGroupSessionLeaseId(),
+      idleTimer: null,
+      idleDeadlineAt: lastOperationAt + getTabGroupIdleTimeout(cmd),
+    };
+    tabGroupSessions.set(key, session);
+    beginTabGroupActivity(key);
+    armTabGroupCleanupForOwnedTabs(key, session);
+    await persistTabGroupSession(key, session);
+    return session;
+  } catch (error) {
+    if (session) await abandonUnpersistedTabGroupSession(key, session);
+    try {
+      await chrome.tabs.remove(seedTab.id);
+    } catch {
+      // Only retry when Chrome confirms this newly created tab belongs to the
+      // expected AutoCLI group; otherwise a reused tab ID must never be closed.
+      // No persisted session exists yet, so a durable retry alarm would not
+      // have authority to close this tab after a restart.
+    }
+    throw error;
+  }
 }
 
-async function getTabGroupSession(workspace: string, cmd: Command): Promise<TabGroupSession> {
+async function getTabGroupSession(cmd: Command): Promise<TabGroupSession> {
   const title = getGroupTitle(cmd);
-  const key = getTabGroupSessionKey(workspace, title);
+  const key = getTabGroupSessionKey(title);
   const existing = await getExistingTabGroupSession(key);
   if (existing) {
-    resetTabGroupIdleTimer(workspace, cmd);
+    await findUniqueTabGroupsByTitle(title);
+    armTabGroupCleanupForOwnedTabs(key, existing);
     return existing;
   }
 
   const pending = tabGroupSessionLocks.get(key);
   if (pending) {
     const session = await pending;
-    resetTabGroupIdleTimer(workspace, cmd);
+    await findUniqueTabGroupsByTitle(title);
+    armTabGroupCleanupForOwnedTabs(key, session);
     return session;
   }
 
-  const creation = createTabGroupSession(workspace, title, key, cmd);
+  const creation = createTabGroupSession(title, key, cmd);
   tabGroupSessionLocks.set(key, creation);
   try {
     return await creation;
@@ -552,16 +1684,68 @@ async function getTabGroupSession(workspace: string, cmd: Command): Promise<TabG
   }
 }
 
-async function resolveTabGroupTab(tabId: number | undefined, workspace: string, cmd: Command, initialUrl?: string): Promise<ResolvedTab> {
-  const session = await getTabGroupSession(workspace, cmd);
+async function clearWorkspaceTabBinding(
+  key: string,
+  session: TabGroupSession,
+  workspace: string,
+  tabId: number,
+): Promise<void> {
+  if (session.workspaceTabIds.get(workspace) !== tabId) return;
+  await enqueueTabGroupSessionMutation(key, async () => {
+    if (tabGroupSessions.get(key) !== session || session.workspaceTabIds.get(workspace) !== tabId) return;
+    session.workspaceTabIds.delete(workspace);
+    await persistTabGroupSession(key, session);
+  });
+}
+
+async function pruneStaleTabGroupTab(
+  key: string,
+  session: TabGroupSession,
+  tabId: number,
+): Promise<void> {
+  await enqueueTabGroupSessionMutation(key, async () => {
+    if (tabGroupSessions.get(key) !== session) return;
+    const removed = session.ownedTabIds.delete(tabId);
+    const removedMetadata = removeTabGroupTabMetadata(session, tabId);
+    if (!removed && !removedMetadata) return;
+    const nextDeadlineAt = armTabGroupCleanupForOwnedTabs(key, session);
+    if (nextDeadlineAt === null) armTabGroupCleanup(key, session, Date.now());
+    await persistTabGroupSession(key, session);
+  });
+}
+
+async function resolveTabGroupTab(
+  tabId: number | undefined,
+  workspace: string,
+  cmd: Command,
+  initialUrl?: string,
+): Promise<ResolvedTab> {
+  const key = getTabGroupSessionKey(getGroupTitle(cmd));
+  const session = await getTabGroupSession(cmd);
 
   if (tabId !== undefined) {
-    const tab = await chrome.tabs.get(tabId);
+    const owner = session.tabWorkspaceOwners.get(tabId);
+    if (owner !== workspace) {
+      if (owner !== undefined) {
+        throw new Error(`strict-background-tab-not-owned: Tab ${tabId} belongs to workspace ${owner}`);
+      }
+      throw new Error(`strict-background-stale-tab: Tab ${tabId} is not owned by workspace ${workspace}`);
+    }
+
+    let tab: chrome.tabs.Tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      await pruneStaleTabGroupTab(key, session, tabId);
+      throw new Error(`strict-background-stale-tab: Tab ${tabId} no longer exists`);
+    }
     if (tab.groupId !== session.groupId) {
-      throw new Error(`Tab ${tabId} is not in strict-background group ${session.title}`);
+      await pruneStaleTabGroupTab(key, session, tabId);
+      throw new Error(`strict-background-stale-tab: Tab ${tabId} is no longer in group ${session.title}`);
     }
     if (!session.ownedTabIds.has(tabId)) {
-      throw new Error(`Tab ${tabId} is not owned by AutoCLI strict-background session ${session.title}`);
+      await pruneStaleTabGroupTab(key, session, tabId);
+      throw new Error(`strict-background-stale-tab: Tab ${tabId} is no longer owned by AutoCLI`);
     }
     if (!isDebuggableUrl(tab.url)) {
       throw new Error(`Tab ${tabId} URL is not debuggable (${tab.url})`);
@@ -569,17 +1753,48 @@ async function resolveTabGroupTab(tabId: number | undefined, workspace: string, 
     return { tabId, tab };
   }
 
-  const tabs = await chrome.tabs.query({ groupId: session.groupId });
-  const debuggableTab = tabs.find((tab) =>
-    tab.id !== undefined && session.ownedTabIds.has(tab.id) && isDebuggableUrl(tab.url)
-  );
-  if (debuggableTab?.id) return { tabId: debuggableTab.id, tab: debuggableTab };
+  const boundTabId = session.workspaceTabIds.get(workspace);
+  if (boundTabId !== undefined) {
+    try {
+      const boundTab = await chrome.tabs.get(boundTabId);
+      if (
+        boundTab.groupId === session.groupId
+        && session.ownedTabIds.has(boundTabId)
+        && session.tabWorkspaceOwners.get(boundTabId) === workspace
+        && isDebuggableUrl(boundTab.url)
+      ) {
+        return { tabId: boundTabId, tab: boundTab };
+      }
+      if (boundTab.groupId !== session.groupId) {
+        await pruneStaleTabGroupTab(key, session, boundTabId);
+      } else {
+        await clearWorkspaceTabBinding(key, session, workspace, boundTabId);
+      }
+    } catch {
+      // The tab can disappear after reconciliation but before this lookup.
+      // Prune the whole ownership record so the current command can recreate
+      // the workspace's background tab instead of surfacing a stale-ID error.
+      await pruneStaleTabGroupTab(key, session, boundTabId);
+    }
+  }
 
+  // Never pick an arbitrary owned tab from a shared group. A different logical
+  // caller may own it, so an unbound workspace always gets a fresh background tab.
   const startUrl = initialUrl && isSafeNavigationUrl(initialUrl) ? initialUrl : BLANK_PAGE;
   const tab = await chrome.tabs.create({ windowId: session.windowId, url: startUrl, active: false });
   if (!tab.id) throw new Error('Failed to create strict-background tab');
-  await chrome.tabs.group({ groupId: session.groupId, tabIds: [tab.id] });
-  session.ownedTabIds.add(tab.id);
+  try {
+    await chrome.tabs.group({ groupId: session.groupId, tabIds: [tab.id] });
+  } catch (error) {
+    try {
+      await chrome.tabs.remove(tab.id);
+    } catch {
+      // This tab was not registered, so it has no durable ownership proof for
+      // a cross-restart retry alarm.
+    }
+    throw error;
+  }
+  await registerNewOwnedTab(key, session, tab.id, cmd, workspace);
   return { tabId: tab.id, tab };
 }
 
@@ -670,19 +1885,34 @@ async function listAutomationWebTabs(workspace: string): Promise<chrome.tabs.Tab
   return tabs.filter((tab) => isDebuggableUrl(tab.url));
 }
 
-async function listTabGroupWebTabs(workspace: string, cmd: Command): Promise<chrome.tabs.Tab[]> {
-  const session = await getTabGroupSession(workspace, cmd);
+async function listTabGroupWebTabs(cmd: Command, workspace: string): Promise<chrome.tabs.Tab[]> {
+  const key = getTabGroupSessionKey(getGroupTitle(cmd));
+  const session = await getExistingTabGroupSession(key);
+  if (!session) return [];
   const tabs = await chrome.tabs.query({ groupId: session.groupId });
   return tabs.filter((tab) =>
-    tab.id !== undefined && session.ownedTabIds.has(tab.id) && isDebuggableUrl(tab.url)
+    tab.id !== undefined
+      && session.ownedTabIds.has(tab.id)
+      && session.tabWorkspaceOwners.get(tab.id) === workspace
+      && isDebuggableUrl(tab.url)
   );
 }
 
-function removeOwnedTab(workspace: string, cmd: Command, tabId: number): void {
+async function removeOwnedTab(cmd: Command, workspace: string, tabId: number): Promise<void> {
   if (!isTabGroupCarrier(cmd)) return;
   const title = getGroupTitle(cmd);
-  const session = tabGroupSessions.get(getTabGroupSessionKey(workspace, title));
-  session?.ownedTabIds.delete(tabId);
+  const key = getTabGroupSessionKey(title);
+  await enqueueTabGroupSessionMutation(key, async () => {
+    const session = tabGroupSessions.get(key);
+    if (!session) return;
+    if (session.tabWorkspaceOwners.get(tabId) !== workspace) return;
+    const removed = session.ownedTabIds.delete(tabId);
+    const removedMetadata = removeTabGroupTabMetadata(session, tabId);
+    if (!removed && !removedMetadata) return;
+    const nextDeadlineAt = armTabGroupCleanupForOwnedTabs(key, session);
+    if (nextDeadlineAt === null) armTabGroupCleanup(key, session, Date.now());
+    await persistTabGroupSession(key, session);
+  });
 }
 
 async function handleExec(cmd: Command, workspace: string): Promise<Result> {
@@ -691,6 +1921,7 @@ async function handleExec(cmd: Command, workspace: string): Promise<Result> {
   try {
     const aggressive = workspace.startsWith('operate:');
     const data = await executor.evaluateAsync(tabId, cmd.code, aggressive);
+    await touchTabGroupTab(cmd, workspace, tabId);
     return { id: cmd.id, ok: true, data };
   } catch (err) {
     return { id: cmd.id, ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -712,6 +1943,7 @@ async function handleNavigate(cmd: Command, workspace: string): Promise<Result> 
 
   // Fast-path: tab is already at the target URL and fully loaded.
   if (beforeTab.status === 'complete' && isTargetUrl(beforeTab.url, targetUrl)) {
+    await touchTabGroupTab(cmd, workspace, tabId);
     return {
       id: cmd.id,
       ok: true,
@@ -793,6 +2025,8 @@ async function handleNavigate(cmd: Command, workspace: string): Promise<Result> 
     }
   }
 
+  await touchTabGroupTab(cmd, workspace, tabId);
+
   return {
     id: cmd.id,
     ok: true,
@@ -804,7 +2038,7 @@ async function handleTabs(cmd: Command, workspace: string): Promise<Result> {
   switch (cmd.op) {
     case 'list': {
       const tabs = isTabGroupCarrier(cmd)
-        ? await listTabGroupWebTabs(workspace, cmd)
+        ? await listTabGroupWebTabs(cmd, workspace)
         : await listAutomationWebTabs(workspace);
       const data = tabs
         .map((t, i) => ({
@@ -821,12 +2055,22 @@ async function handleTabs(cmd: Command, workspace: string): Promise<Result> {
         return { id: cmd.id, ok: false, error: 'Blocked URL scheme -- only http:// and https:// are allowed' };
       }
       if (isTabGroupCarrier(cmd)) {
-        const session = await getTabGroupSession(workspace, cmd);
+        const session = await getTabGroupSession(cmd);
+        const key = getTabGroupSessionKey(getGroupTitle(cmd));
         const tab = await chrome.tabs.create({ windowId: session.windowId, url: cmd.url ?? BLANK_PAGE, active: false });
         if (!tab.id) return { id: cmd.id, ok: false, error: 'Failed to create strict-background tab' };
-        await chrome.tabs.group({ groupId: session.groupId, tabIds: [tab.id] });
-        session.ownedTabIds.add(tab.id);
-        resetTabGroupIdleTimer(workspace, cmd);
+        try {
+          await chrome.tabs.group({ groupId: session.groupId, tabIds: [tab.id] });
+        } catch (error) {
+          try {
+            await chrome.tabs.remove(tab.id);
+          } catch {
+            // This tab was not registered, so it cannot be retried safely
+            // after an extension restart.
+          }
+          throw error;
+        }
+        await registerNewOwnedTab(key, session, tab.id, cmd, workspace);
         return { id: cmd.id, ok: true, data: { tabId: tab.id, url: tab.url } };
       }
       const windowId = await getAutomationWindow(workspace);
@@ -836,19 +2080,27 @@ async function handleTabs(cmd: Command, workspace: string): Promise<Result> {
     case 'close': {
       if (cmd.index !== undefined) {
         const tabs = isTabGroupCarrier(cmd)
-          ? await listTabGroupWebTabs(workspace, cmd)
+          ? await listTabGroupWebTabs(cmd, workspace)
           : await listAutomationWebTabs(workspace);
         const target = tabs[cmd.index];
         if (!target?.id) return { id: cmd.id, ok: false, error: `Tab index ${cmd.index} not found` };
         await chrome.tabs.remove(target.id);
         await executor.detach(target.id);
-        removeOwnedTab(workspace, cmd, target.id);
+        await removeOwnedTab(cmd, workspace, target.id);
         return { id: cmd.id, ok: true, data: { closed: target.id } };
+      }
+      if (isTabGroupCarrier(cmd) && cmd.tabId === undefined) {
+        const boundTabId = (await getExistingTabGroupSession(getTabGroupSessionKey(getGroupTitle(cmd))))
+          ?.workspaceTabIds.get(workspace);
+        if (boundTabId === undefined) {
+          return { id: cmd.id, ok: false, error: `No strict-background tab is bound to workspace ${workspace}` };
+        }
+        cmd = { ...cmd, tabId: boundTabId };
       }
       const tabId = await resolveTabId(cmd.tabId, workspace, undefined, cmd);
       await chrome.tabs.remove(tabId);
       await executor.detach(tabId);
-      removeOwnedTab(workspace, cmd, tabId);
+      await removeOwnedTab(cmd, workspace, tabId);
       return { id: cmd.id, ok: true, data: { closed: tabId } };
     }
     case 'select': {
@@ -910,6 +2162,7 @@ async function handleScreenshot(cmd: Command, workspace: string): Promise<Result
       quality: cmd.quality,
       fullPage: cmd.fullPage,
     });
+    await touchTabGroupTab(cmd, workspace, tabId);
     return { id: cmd.id, ok: true, data };
   } catch (err) {
     return { id: cmd.id, ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -954,6 +2207,7 @@ async function handleCdp(cmd: Command, workspace: string): Promise<Result> {
       cmd.cdpMethod,
       cmd.cdpParams ?? {},
     );
+    await touchTabGroupTab(cmd, workspace, tabId);
     return { id: cmd.id, ok: true, data };
   } catch (err) {
     return { id: cmd.id, ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -963,7 +2217,7 @@ async function handleCdp(cmd: Command, workspace: string): Promise<Result> {
 async function handleCloseWindow(cmd: Command, workspace: string): Promise<Result> {
   if (isTabGroupCarrier(cmd)) {
     validateStrictBackgroundCommand(cmd);
-    resetTabGroupIdleTimer(workspace, cmd);
+    await touchWorkspaceTabOnStrictBackgroundRelease(cmd, workspace);
     return { id: cmd.id, ok: true, data: { released: true } };
   }
   const session = automationSessions.get(workspace);
@@ -986,6 +2240,7 @@ async function handleSetFileInput(cmd: Command, workspace: string): Promise<Resu
   const tabId = await resolveTabId(cmd.tabId, workspace, undefined, cmd);
   try {
     await executor.setFileInputFiles(tabId, cmd.files, cmd.selector);
+    await touchTabGroupTab(cmd, workspace, tabId);
     return { id: cmd.id, ok: true, data: { count: cmd.files.length } };
   } catch (err) {
     return { id: cmd.id, ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -1076,6 +2331,7 @@ async function handleReadArticle(cmd: Command, workspace: string): Promise<Resul
   if (!payload) return { id: cmd.id, ok: false, error: 'Extractor returned no result' };
   if (typeof payload.__err === 'string') return { id: cmd.id, ok: false, error: payload.__err };
 
+  await touchTabGroupTab(cmd, workspace, tabId);
   return { id: cmd.id, ok: true, data: payload };
 }
 

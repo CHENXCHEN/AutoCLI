@@ -66,7 +66,51 @@ impl DaemonPage {
 
     /// Send a command via the daemon client.
     async fn send(&self, cmd: DaemonCommand) -> Result<Value, CliError> {
-        self.client.send_command(cmd).await
+        match self.client.send_command(cmd.clone()).await {
+            Ok(response) => Ok(response),
+            Err(error) if self.should_retry_stale_tab(&cmd, &error).await => {
+                let mut retry = cmd;
+                retry.id = uuid::Uuid::new_v4().to_string();
+                retry.tab_id = None;
+                self.client.send_command(retry).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns true after atomically dropping the cached tab only when `cmd`
+    /// still points at that cache entry. A stale-tab retry must not discard a
+    /// newer tab selected by another operation on the same page.
+    async fn should_retry_stale_tab(&self, cmd: &DaemonCommand, error: &CliError) -> bool {
+        if !matches!(cmd.action.as_str(), "navigate" | "read-article")
+            || self.browser_config.carrier != BrowserCarrier::TabGroupBackground
+            || !is_strict_background_stale_tab_error(error)
+        {
+            return false;
+        }
+
+        let Some(tab_id) = cmd.tab_id else {
+            return false;
+        };
+
+        let mut cached_tab_id = self.tab_id.write().await;
+        if *cached_tab_id != Some(tab_id) {
+            return false;
+        }
+
+        *cached_tab_id = None;
+        true
+    }
+
+    fn navigate_tab_id(response: &Value) -> Result<u64, CliError> {
+        response
+            .get("tabId")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                CliError::command_execution(
+                    "Navigate response did not include a tabId; refusing to use an implicit tab",
+                )
+            })
     }
 
     /// Evaluate JS on the current page via the daemon.
@@ -91,7 +135,8 @@ impl DaemonPage {
 impl IPage for DaemonPage {
     async fn goto(&self, url: &str, _options: Option<GotoOptions>) -> Result<(), CliError> {
         let cmd = self.cmd("navigate").await.with_url(url);
-        self.send(cmd).await?;
+        let response = self.send(cmd).await?;
+        *self.tab_id.write().await = Some(Self::navigate_tab_id(&response)?);
         // The Chrome extension's handleNavigate already waits for the page to
         // fully load (URL change + status=complete, up to 15s). No additional
         // DOM stability check is needed here.
@@ -221,21 +266,30 @@ impl IPage for DaemonPage {
     }
 
     async fn tabs(&self) -> Result<Vec<TabInfo>, CliError> {
-        let cmd = self.cmd("tabs").await;
+        let cmd = self.cmd("tabs").await.with_op("list");
         let val = self.send(cmd).await?;
-        let tabs: Vec<TabInfo> = serde_json::from_value(val).unwrap_or_default();
-        Ok(tabs)
+        Ok(parse_daemon_tabs(&val))
     }
 
     async fn switch_tab(&self, tab_id: &str) -> Result<(), CliError> {
         let tid: u64 = tab_id
             .parse()
             .map_err(|_| CliError::argument(format!("Invalid tab id: {tab_id}")))?;
-        *self.tab_id.write().await = Some(tid);
-        let mut cmd = self.cmd("tabs").await;
-        cmd.url = Some("switch".to_string());
-        cmd.tab_id = Some(tid);
+
+        if switches_tab_locally(&self.browser_config.carrier) {
+            let tabs = self.tabs().await?;
+            if !contains_tab_id(&tabs, tid) {
+                return Err(CliError::command_execution(format!(
+                    "Tab {tid} is not available in the current strict-background workspace"
+                )));
+            }
+            *self.tab_id.write().await = Some(tid);
+            return Ok(());
+        }
+
+        let cmd = self.cmd("tabs").await.with_op("select").with_tab_id(tid);
         self.send(cmd).await?;
+        *self.tab_id.write().await = Some(tid);
         Ok(())
     }
 
@@ -263,6 +317,169 @@ impl IPage for DaemonPage {
         let val = self.eval_js(&js).await?;
         let reqs: Vec<NetworkRequest> = serde_json::from_value(val).unwrap_or_default();
         Ok(reqs)
+    }
+}
+
+const STRICT_BACKGROUND_STALE_TAB_ERROR: &str = "strict-background-stale-tab:";
+
+fn switches_tab_locally(carrier: &BrowserCarrier) -> bool {
+    *carrier == BrowserCarrier::TabGroupBackground
+}
+
+fn contains_tab_id(tabs: &[TabInfo], tab_id: u64) -> bool {
+    tabs.iter().any(|tab| tab.id == tab_id.to_string())
+}
+
+fn parse_daemon_tabs(value: &Value) -> Vec<TabInfo> {
+    let Some(tabs) = value.as_array() else {
+        return Vec::new();
+    };
+
+    tabs.iter()
+        .filter_map(|tab| {
+            let id = tab
+                .get("tabId")
+                .or_else(|| tab.get("id"))
+                .and_then(|id| match id {
+                    Value::String(id) => Some(id.clone()),
+                    Value::Number(id) => Some(id.to_string()),
+                    _ => None,
+                })?;
+            Some(TabInfo {
+                id,
+                url: tab
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                title: tab
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+            })
+        })
+        .collect()
+}
+
+/// The daemon wraps extension errors before returning them to the browser
+/// client. Only the explicit stale-tab marker permits a retry; errors about a
+/// tab owned by another workspace and all unrelated failures remain terminal.
+fn is_strict_background_stale_tab_error(error: &CliError) -> bool {
+    let CliError::CommandExecution { message, .. } = error else {
+        return false;
+    };
+
+    message.starts_with(STRICT_BACKGROUND_STALE_TAB_ERROR)
+        || message
+            .strip_prefix("Daemon command failed: ")
+            .is_some_and(|message| message.starts_with(STRICT_BACKGROUND_STALE_TAB_ERROR))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        contains_tab_id, is_strict_background_stale_tab_error, parse_daemon_tabs,
+        switches_tab_locally, DaemonPage,
+    };
+    use autocli_core::CliError;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    use crate::{
+        config::{BrowserCarrier, BrowserConfig},
+        daemon_client::DaemonClient,
+        types::DaemonCommand,
+    };
+
+    #[test]
+    fn navigate_tab_id_reads_the_extension_response() {
+        assert_eq!(
+            DaemonPage::navigate_tab_id(&json!({ "tabId": 42 })).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn navigate_tab_id_rejects_an_implicit_target() {
+        assert!(DaemonPage::navigate_tab_id(&json!({ "url": "https://example.com" })).is_err());
+    }
+
+    #[test]
+    fn recognizes_only_the_explicit_strict_background_stale_tab_error() {
+        let stale = CliError::command_execution(
+            "Daemon command failed: strict-background-stale-tab: tab 42 is no longer available",
+        );
+        let foreign_owner = CliError::command_execution(
+            "Daemon command failed: strict-background-foreign-tab: tab 42 belongs to another workspace",
+        );
+        let unrelated = CliError::command_execution("Daemon command failed: navigation timed out");
+
+        assert!(is_strict_background_stale_tab_error(&stale));
+        assert!(!is_strict_background_stale_tab_error(&foreign_owner));
+        assert!(!is_strict_background_stale_tab_error(&unrelated));
+    }
+
+    #[test]
+    fn does_not_classify_non_command_errors_as_stale_tab_errors() {
+        let error = CliError::browser_connect("strict-background-stale-tab: disconnected");
+        assert!(!is_strict_background_stale_tab_error(&error));
+    }
+
+    #[test]
+    fn strict_background_switches_tabs_only_in_local_page_state() {
+        assert!(switches_tab_locally(&BrowserCarrier::TabGroupBackground));
+        assert!(!switches_tab_locally(&BrowserCarrier::AutomationWindow));
+    }
+
+    #[test]
+    fn parses_extension_tab_list_and_validates_tab_ownership() {
+        let tabs = parse_daemon_tabs(&json!([
+            { "tabId": 42, "url": "https://example.com", "title": "Example" },
+            { "tabId": 84, "url": "https://example.org" }
+        ]));
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].id, "42");
+        assert!(contains_tab_id(&tabs, 42));
+        assert!(!contains_tab_id(&tabs, 7));
+    }
+
+    #[tokio::test]
+    async fn stale_tab_retry_requires_the_current_cached_tab_and_a_retryable_action() {
+        let page = DaemonPage::new_with_browser_config(
+            Arc::new(DaemonClient::new(0)),
+            "workspace",
+            BrowserConfig {
+                carrier: BrowserCarrier::TabGroupBackground,
+                group_name: Some("work".to_string()),
+                group_idle_timeout_seconds: None,
+            },
+        );
+        let stale = CliError::command_execution(
+            "Daemon command failed: strict-background-stale-tab: tab 42 is no longer available",
+        );
+        *page.tab_id.write().await = Some(42);
+
+        assert!(
+            page.should_retry_stale_tab(&DaemonCommand::new("navigate").with_tab_id(42), &stale)
+                .await
+        );
+        assert_eq!(*page.tab_id.read().await, None);
+
+        *page.tab_id.write().await = Some(42);
+        assert!(
+            !page
+                .should_retry_stale_tab(&DaemonCommand::new("exec").with_tab_id(42), &stale)
+                .await
+        );
+        assert_eq!(*page.tab_id.read().await, Some(42));
+
+        assert!(
+            !page
+                .should_retry_stale_tab(&DaemonCommand::new("navigate").with_tab_id(7), &stale)
+                .await
+        );
+        assert_eq!(*page.tab_id.read().await, Some(42));
     }
 }
 

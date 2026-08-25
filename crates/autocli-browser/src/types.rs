@@ -10,8 +10,10 @@ pub struct DaemonCommand {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<String>,
+    pub op: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(rename = "tabId", skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
@@ -33,6 +35,7 @@ impl DaemonCommand {
             action: action.into(),
             code: None,
             url: None,
+            op: None,
             workspace: None,
             tab_id: None,
             format: None,
@@ -49,6 +52,11 @@ impl DaemonCommand {
 
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
+        self
+    }
+
+    pub fn with_op(mut self, op: impl Into<String>) -> Self {
+        self.op = Some(op.into());
         self
     }
 
@@ -145,5 +153,37 @@ impl DaemonResult {
             data: None,
             error: Some(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DaemonCommand;
+
+    #[test]
+    fn daemon_command_serializes_and_deserializes_extension_fields() {
+        let command = DaemonCommand::new("tabs").with_op("new").with_tab_id(42);
+        let value = serde_json::to_value(&command).expect("command should serialize");
+
+        assert_eq!(
+            value.get("op").and_then(serde_json::Value::as_str),
+            Some("new")
+        );
+        assert_eq!(
+            value.get("tabId").and_then(serde_json::Value::as_u64),
+            Some(42)
+        );
+        assert!(value.get("tab_id").is_none());
+
+        let decoded: DaemonCommand = serde_json::from_value(serde_json::json!({
+            "id": "request-1",
+            "action": "tabs",
+            "op": "select",
+            "tabId": 42,
+        }))
+        .expect("camelCase tabId should deserialize");
+
+        assert_eq!(decoded.tab_id, Some(42));
+        assert_eq!(decoded.op.as_deref(), Some("select"));
     }
 }

@@ -143,9 +143,11 @@ AUTOCLI_BROWSER_GROUP_NAME=work
 AUTOCLI_BROWSER_GROUP_IDLE_TIMEOUT=30
 ```
 
-启用后组名统一为 `AutoCLI-${groupName}`，同名 Tab Group 会被复用；未设置或留空 `groupName` 时默认为 `default`，即 `AutoCLI-default`。该模式严格不创建新的可见 Chrome 窗口、不切换到 AutoCLI 标签、不抢当前活动标签；如果 Chrome、扩展或现有普通 Chrome 窗口不可用，会直接报错，不会自动回退到新窗口或激活标签。`tabs select` 在该模式下不可用。
+启用后实际组名为 `AutoCLI-${groupName}`；在同一 Chrome 配置文件中，全局复用唯一一个完全同名的 Tab Group。未设置或留空 `groupName` 时默认为 `default`，即 `AutoCLI-default`。如果同时存在多个同名的开放分组，命令会直接报错，而不会猜测应管理哪个分组或哪些标签。该模式严格不创建新的可见 Chrome 窗口、不切换到 AutoCLI 标签、不抢当前活动标签；如果 Chrome、扩展或现有普通 Chrome 窗口不可用，会直接报错，不会自动回退到新窗口或激活标签。`tabs select` 在该模式下不可用。
 
-命令结束时会短暂保留同一组用于连续命令；空闲超时后只清理 AutoCLI 在该组内创建的标签。回滚到旧行为时，删除这些环境变量或将 `carrier` 改回 `automation-window`。
+`workspace` 不是网站，也不参与分组命名；它只用于共享分组内的逻辑调用者和 `tabId` 所有权追踪。相同 `groupName` 的不同调用即使访问不同网站，也只使用这一个物理分组，并且只能操作或清理各自创建的标签，绝不会任选或删除其他调用及用户原有的标签。
+
+命令结束时会短暂保留同一组用于连续命令；在严格后台模式下，`groupIdleTimeoutSeconds` 是每个 AutoCLI 创建标签的空闲 TTL。扩展会为每个 `tabId` 记录最后一次成功的 AutoCLI 操作时间，并在该标签自身超时后关闭它；对另一个标签的操作或 `tabs list` 不会续期它。一个组只保留一个调度器，始终处理最早到期的 AutoCLI 标签；只有没有剩余 AutoCLI 标签时才释放该组的会话记录。所有权和活动记录保存在 `chrome.storage.session` 中，因此可跨 MV3 service worker 挂起保留；但扩展重载、更新或浏览器重启后会有意丢弃这些记录：Chrome ID 仅在当前浏览器会话中可靠，跨越该边界后 AutoCLI 不会猜测所有权或删除已有标签。回滚到旧行为时，删除这些环境变量或将 `carrier` 改回 `automation-window`。
 
 自定义本地 adapter 也可以单独指定浏览器承载方式，且会覆盖全局配置和环境变量：
 

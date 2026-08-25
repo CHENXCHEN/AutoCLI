@@ -14,6 +14,25 @@ pub struct DaemonClient {
 /// Retry delays for exponential backoff.
 const RETRY_DELAYS_MS: [u64; 4] = [200, 500, 1000, 2000];
 
+/// Preserve structured extension failures returned with HTTP 422.
+///
+/// The daemon uses 422 for command failures, even though the JSON body still
+/// follows the normal `DaemonResult` envelope. Callers rely on this error text
+/// to recognize strict-background stale-tab failures and retry with a fresh tab.
+fn daemon_failure_from_unprocessable_entity(body: &str) -> Option<CliError> {
+    let daemon_result = serde_json::from_str::<DaemonResult>(body).ok()?;
+    if daemon_result.ok {
+        return None;
+    }
+
+    let err_msg = daemon_result
+        .error
+        .unwrap_or_else(|| "Unknown daemon error".into());
+    Some(CliError::command_execution(format!(
+        "Daemon command failed: {err_msg}"
+    )))
+}
+
 impl DaemonClient {
     /// Create a new client pointing at the given port on localhost.
     pub fn new(port: u16) -> Self {
@@ -51,7 +70,9 @@ impl DaemonClient {
 
                     if status.is_success() {
                         let daemon_result: DaemonResult = resp.json().await.map_err(|e| {
-                            CliError::browser_connect(format!("Failed to parse daemon response: {e}"))
+                            CliError::browser_connect(format!(
+                                "Failed to parse daemon response: {e}"
+                            ))
                         })?;
                         if daemon_result.ok {
                             return Ok(daemon_result.data.unwrap_or(Value::Null));
@@ -68,6 +89,11 @@ impl DaemonClient {
                     // 4xx errors are client/business errors — don't retry
                     if status.is_client_error() {
                         let body = resp.text().await.unwrap_or_default();
+                        if status.as_u16() == 422 {
+                            if let Some(error) = daemon_failure_from_unprocessable_entity(&body) {
+                                return Err(error);
+                            }
+                        }
                         return Err(CliError::command_execution(format!(
                             "Command error (HTTP {status}): {body}"
                         )));
@@ -162,5 +188,27 @@ mod tests {
     async fn test_is_extension_connected_when_no_server() {
         let client = DaemonClient::new(19999);
         assert!(!client.is_extension_connected().await);
+    }
+
+    #[test]
+    fn parses_structured_422_daemon_failure() {
+        let error = daemon_failure_from_unprocessable_entity(
+            r#"{"id":"request-1","ok":false,"error":"strict-background-stale-tab: tab 42 is no longer available"}"#,
+        )
+        .expect("structured daemon failure should parse");
+
+        assert_eq!(
+            error.to_string(),
+            "[command] Daemon command failed: strict-background-stale-tab: tab 42 is no longer available"
+        );
+    }
+
+    #[test]
+    fn leaves_non_failure_or_non_daemon_422_bodies_for_generic_handling() {
+        assert!(daemon_failure_from_unprocessable_entity("forbidden").is_none());
+        assert!(daemon_failure_from_unprocessable_entity(
+            r#"{"id":"request-1","ok":true,"data":{}}"#
+        )
+        .is_none());
     }
 }
