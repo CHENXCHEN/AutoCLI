@@ -18,6 +18,7 @@ use std::{
 };
 use tokio::sync::{oneshot, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::types::{DaemonCommand, DaemonResult};
 
@@ -28,22 +29,31 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// Idle shutdown threshold.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-type PendingMap = HashMap<String, oneshot::Sender<DaemonResult>>;
+struct PendingCommand {
+    connection_id: Uuid,
+    response_tx: oneshot::Sender<DaemonResult>,
+}
+
+type PendingMap = HashMap<String, PendingCommand>;
+type ExtensionSender = futures::stream::SplitSink<WebSocket, Message>;
+
+struct ExtensionConnection {
+    id: Uuid,
+    sender: ExtensionSender,
+}
 
 /// Shared state for the daemon server.
 pub struct DaemonState {
-    pub extension_tx: Mutex<Option<futures::stream::SplitSink<WebSocket, Message>>>,
-    pub pending_commands: RwLock<PendingMap>,
-    pub extension_connected: RwLock<bool>,
+    extension_connection: Mutex<Option<ExtensionConnection>>,
+    pending_commands: RwLock<PendingMap>,
     pub last_activity: RwLock<Instant>,
 }
 
 impl DaemonState {
     fn new() -> Self {
         Self {
-            extension_tx: Mutex::new(None),
+            extension_connection: Mutex::new(None),
             pending_commands: RwLock::new(HashMap::new()),
-            extension_connected: RwLock::new(false),
             last_activity: RwLock::new(Instant::now()),
         }
     }
@@ -87,8 +97,11 @@ impl Daemon {
             .map_err(|e| {
                 CliError::browser_connect(format!("Failed to bind daemon on port {port}: {e}"))
             })?;
+        let bound_port = listener.local_addr().map_err(|e| {
+            CliError::browser_connect(format!("Failed to read daemon port after binding: {e}"))
+        })?.port();
 
-        info!(port, "daemon listening");
+        info!(port = bound_port, "daemon listening");
 
         // Spawn hourly update checker
         tokio::spawn(async {
@@ -110,7 +123,7 @@ impl Daemon {
         });
 
         Ok(Self {
-            port,
+            port: bound_port,
             shutdown_tx: Some(shutdown_tx),
         })
     }
@@ -375,7 +388,7 @@ async fn upload_adapter_to_server(api_base: &str, token: &str, yaml: &str) -> Re
 /// GET /status — return daemon and extension status.
 /// Compatible with both autocli and original opencli formats.
 async fn status_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
-    let ext = *state.extension_connected.read().await;
+    let ext = state.extension_connection.lock().await.is_some();
     let pending = state.pending_commands.read().await.len();
     Json(json!({
         "daemon": true,
@@ -403,37 +416,36 @@ async fn command_handler(
 
     state.touch().await;
 
-    // Check extension connected
-    if !*state.extension_connected.read().await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "Chrome extension not connected" })),
-        );
-    }
-
     let cmd_id = cmd.id.clone();
 
     // Create a oneshot channel for the result
     let (tx, rx) = oneshot::channel::<DaemonResult>();
-    state.pending_commands.write().await.insert(cmd_id.clone(), tx);
 
-    // Forward command to extension via WebSocket
+    // Bind the request to the sender while holding the connection lock, so a
+    // replacement connection cannot later be mistaken for the original owner.
     {
-        let mut ext_tx = state.extension_tx.lock().await;
-        if let Some(ref mut sink) = *ext_tx {
-            let msg = serde_json::to_string(&cmd).unwrap_or_default();
-            if let Err(e) = sink.send(Message::Text(msg.into())).await {
-                state.pending_commands.write().await.remove(&cmd_id);
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({ "error": format!("Failed to send to extension: {e}") })),
-                );
-            }
-        } else {
-            state.pending_commands.write().await.remove(&cmd_id);
+        let mut extension_connection = state.extension_connection.lock().await;
+        let Some(connection) = extension_connection.as_mut() else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "Extension WebSocket not available" })),
+                Json(json!({ "error": "Chrome extension not connected" })),
+            );
+        };
+
+        state.pending_commands.write().await.insert(
+            cmd_id.clone(),
+            PendingCommand {
+                connection_id: connection.id,
+                response_tx: tx,
+            },
+        );
+
+        let msg = serde_json::to_string(&cmd).unwrap_or_default();
+        if let Err(e) = connection.sender.send(Message::Text(msg.into())).await {
+            state.pending_commands.write().await.remove(&cmd_id);
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("Failed to send to extension: {e}") })),
             );
         }
     }
@@ -472,20 +484,27 @@ async fn ws_handler(
 
 async fn handle_extension_ws(state: Arc<DaemonState>, socket: WebSocket) {
     let (sender, mut receiver) = socket.split();
+    let connection_id = Uuid::new_v4();
 
     // Store the sender so we can forward commands
-    *state.extension_tx.lock().await = Some(sender);
-    *state.extension_connected.write().await = true;
+    *state.extension_connection.lock().await = Some(ExtensionConnection {
+        id: connection_id,
+        sender,
+    });
     info!("Chrome extension connected");
 
     // Spawn heartbeat pinger
     let heartbeat_state = state.clone();
+    let heartbeat_connection_id = connection_id;
     let heartbeat_handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-            let mut tx = heartbeat_state.extension_tx.lock().await;
-            if let Some(ref mut sink) = *tx {
-                if sink.send(Message::Ping(vec![].into())).await.is_err() {
+            let mut extension_connection = heartbeat_state.extension_connection.lock().await;
+            if let Some(connection) = extension_connection.as_mut() {
+                if connection.id != heartbeat_connection_id {
+                    break;
+                }
+                if connection.sender.send(Message::Ping(vec![].into())).await.is_err() {
                     break;
                 }
             } else {
@@ -523,8 +542,14 @@ async fn handle_extension_ws(state: Arc<DaemonState>, socket: WebSocket) {
                 match serde_json::from_str::<DaemonResult>(&text) {
                     Ok(result) => {
                         let id = result.id.clone();
-                        if let Some(tx) = state.pending_commands.write().await.remove(&id) {
-                            let _ = tx.send(result);
+                        let mut pending = state.pending_commands.write().await;
+                        let belongs_to_this_connection = pending
+                            .get(&id)
+                            .is_some_and(|request| request.connection_id == connection_id);
+                        if belongs_to_this_connection {
+                            if let Some(request) = pending.remove(&id) {
+                                let _ = request.response_tx.send(result);
+                            }
                         } else {
                             warn!(id = %id, "received result for unknown command");
                         }
@@ -551,17 +576,37 @@ async fn handle_extension_ws(state: Arc<DaemonState>, socket: WebSocket) {
 
     // Clean up
     heartbeat_handle.abort();
-    *state.extension_tx.lock().await = None;
-    *state.extension_connected.write().await = false;
-    info!("Chrome extension disconnected");
+    let disconnected = {
+        let mut extension_connection = state.extension_connection.lock().await;
+        if extension_connection
+            .as_ref()
+            .is_some_and(|connection| connection.id == connection_id)
+        {
+            *extension_connection = None;
+            true
+        } else {
+            false
+        }
+    };
 
-    // Fail all pending commands
+    if disconnected {
+        info!("Chrome extension disconnected");
+    }
+
+    // Fail only the requests forwarded to this connection. A replacement
+    // connection must keep both its state and its own pending requests.
     let mut pending = state.pending_commands.write().await;
-    for (id, tx) in pending.drain() {
-        let _ = tx.send(DaemonResult::failure(
-            id,
-            "Extension disconnected".to_string(),
-        ));
+    let ids: Vec<String> = pending
+        .iter()
+        .filter_map(|(id, request)| (request.connection_id == connection_id).then(|| id.clone()))
+        .collect();
+    for id in ids {
+        if let Some(request) = pending.remove(&id) {
+            let _ = request.response_tx.send(DaemonResult::failure(
+                id,
+                "Extension disconnected".to_string(),
+            ));
+        }
     }
 }
 
@@ -569,9 +614,9 @@ async fn handle_extension_ws(state: Arc<DaemonState>, socket: WebSocket) {
 async fn handle_ai_stream_via_ws(state: Arc<DaemonState>, stream_id: String, body: serde_json::Value) {
     // Helper to send message back through extension WS
     async fn send_ws(state: &Arc<DaemonState>, msg: serde_json::Value) {
-        let mut tx = state.extension_tx.lock().await;
-        if let Some(ref mut sink) = *tx {
-            let _ = sink.send(Message::Text(msg.to_string().into())).await;
+        let mut extension_connection = state.extension_connection.lock().await;
+        if let Some(connection) = extension_connection.as_mut() {
+            let _ = connection.sender.send(Message::Text(msg.to_string().into())).await;
         }
     }
 
@@ -834,16 +879,93 @@ async fn check_update_handler() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as ClientMessage};
+
+    type TestExtensionSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn extension_is_connected(port: u16) -> bool {
+        let Ok(response) = reqwest::get(format!("http://127.0.0.1:{port}/status")).await else {
+            return false;
+        };
+        let Ok(body) = response.json::<serde_json::Value>().await else {
+            return false;
+        };
+        body.get("extension")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    async fn wait_for_extension_status(port: u16, expected: bool) {
+        for _ in 0..100 {
+            if extension_is_connected(port).await == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("extension status did not become {expected}");
+    }
+
+    fn post_command(port: u16, command: DaemonCommand) -> tokio::task::JoinHandle<reqwest::Response> {
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/command"))
+                .header("X-AutoCLI", "1")
+                .json(&command)
+                .send()
+                .await
+                .expect("submit daemon command")
+        })
+    }
+
+    async fn receive_command(socket: &mut TestExtensionSocket) -> DaemonCommand {
+        let message = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("receive command before timeout")
+            .expect("extension socket remains open")
+            .expect("receive valid command frame");
+        let ClientMessage::Text(text) = message else {
+            panic!("expected a command text frame");
+        };
+        serde_json::from_str(&text).expect("parse daemon command")
+    }
+
+    async fn reply_success(socket: &mut TestExtensionSocket, command: &DaemonCommand) {
+        let result = DaemonResult::success(command.id.clone(), json!({}));
+        let payload = serde_json::to_string(&result).expect("serialize command result");
+        socket
+            .send(ClientMessage::Text(payload.into()))
+            .await
+            .expect("respond to daemon command");
+    }
+
+    async fn wait_for_command_response(
+        request: tokio::task::JoinHandle<reqwest::Response>,
+    ) -> reqwest::Response {
+        tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .expect("command response before timeout")
+            .expect("command request task completes")
+    }
+
+    async fn prove_socket_is_active(port: u16, socket: &mut TestExtensionSocket) {
+        let probe = DaemonCommand::new("probe");
+        let request = post_command(port, probe.clone());
+        let received = receive_command(socket).await;
+        assert_eq!(received.id, probe.id, "the replacement socket received the probe");
+        reply_success(socket, &received).await;
+
+        let response = wait_for_command_response(request).await;
+        assert!(response.status().is_success(), "the probe completed through the replacement socket");
+    }
 
     #[tokio::test]
     async fn test_daemon_start_and_shutdown() {
-        let daemon = Daemon::start(0).await;
-        // Port 0 lets the OS assign a random port, but our code binds to a specific port.
-        // For testing, use a high random port.
-        // This test just verifies the code path doesn't panic.
-        // In practice, we'd use port 0 with TcpListener and extract the actual port.
-        // For now, just verify construction logic.
-        assert!(daemon.is_ok() || daemon.is_err());
+        let daemon = Daemon::start(0).await.expect("start daemon on an ephemeral port");
+        assert_ne!(daemon.port(), 0, "report the port assigned by the OS");
+        daemon.shutdown().await.expect("shut down daemon");
     }
 
     #[tokio::test]
@@ -854,5 +976,69 @@ mod tests {
         state.touch().await;
         let after = *state.last_activity.read().await;
         assert!(after > before);
+    }
+
+    #[tokio::test]
+    async fn keeps_extension_connected_when_the_replaced_socket_closes() {
+        let daemon = Daemon::start(0).await.expect("start test daemon");
+        let port = daemon.port();
+        let endpoint = format!("ws://127.0.0.1:{port}/ext");
+
+        let (mut older, _) = connect_async(&endpoint).await.expect("connect older extension");
+        wait_for_extension_status(port, true).await;
+
+        let (mut newer, _) = connect_async(&endpoint).await.expect("connect replacement extension");
+        prove_socket_is_active(port, &mut newer).await;
+
+        older
+            .send(ClientMessage::Close(None))
+            .await
+            .expect("close older extension");
+        let _ = tokio::time::timeout(Duration::from_secs(1), older.next()).await;
+        for _ in 0..20 {
+            assert!(
+                extension_is_connected(port).await,
+                "closing an older extension socket must not disconnect its replacement"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let _ = newer.send(ClientMessage::Close(None)).await;
+        daemon.shutdown().await.expect("shut down test daemon");
+    }
+
+    #[tokio::test]
+    async fn fails_pending_command_when_its_replaced_socket_closes() {
+        let daemon = Daemon::start(0).await.expect("start test daemon");
+        let port = daemon.port();
+        let endpoint = format!("ws://127.0.0.1:{port}/ext");
+
+        let (mut older, _) = connect_async(&endpoint).await.expect("connect older extension");
+        wait_for_extension_status(port, true).await;
+
+        let pending = DaemonCommand::new("pending");
+        let pending_request = post_command(port, pending.clone());
+        let received_by_older = receive_command(&mut older).await;
+        assert_eq!(received_by_older.id, pending.id, "the older socket owns this command");
+
+        let (mut newer, _) = connect_async(&endpoint).await.expect("connect replacement extension");
+        prove_socket_is_active(port, &mut newer).await;
+
+        older
+            .send(ClientMessage::Close(None))
+            .await
+            .expect("close older extension");
+        let response = wait_for_command_response(pending_request).await;
+        let status = response.status();
+        let body = response.json::<serde_json::Value>().await.expect("parse command failure");
+
+        let _ = newer.send(ClientMessage::Close(None)).await;
+        daemon.shutdown().await.expect("shut down test daemon");
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("Extension disconnected")
+        );
     }
 }
