@@ -1,11 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { Worker, isMainThread } from 'node:worker_threads';
 import { pathToFileURL } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_EXECUTION_TIMEOUT_MS = 55_000;
 const MAX_TIMEOUT_MS = 600_000;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+// Cover the extension's ~24s keepalive when a daemon was started after it.
+// The preflight signal and the whole-command deadline can stop this sooner.
+const COOKIE_RECONNECT_DELAYS_MS = [250, 500, 1000, ...Array(14).fill(2000)];
 
 class CookieHttpError extends Error {}
 
@@ -113,18 +117,37 @@ async function boundedText(response, signal) {
 
 function transportFor(policy, fetchImpl, executionSignal, secrets, onWriteSubmitted) {
   async function cookiesFor(url, signal) {
-    signal.throwIfAborted();
     let response;
-    try {
-      response = await fetchImpl(`http://127.0.0.1:${policy.port}/command`, {
-        method: 'POST', redirect: 'error', signal,
-        headers: { 'content-type': 'application/json', 'X-AutoCLI': '1' },
-        body: JSON.stringify({ id: randomUUID(), action: 'cookies', url }),
-      });
-    } catch {
-      throw new CookieHttpError(signal.aborted ? 'cookie_http command timed out' : 'cookie_http could not reach the AutoCLI daemon');
+    for (let attempt = 0; ; attempt++) {
+      let unavailable = false;
+      try {
+        signal.throwIfAborted();
+        response = await fetchImpl(`http://127.0.0.1:${policy.port}/command`, {
+          method: 'POST', redirect: 'error', signal,
+          headers: { 'content-type': 'application/json', 'X-AutoCLI': '1' },
+          body: JSON.stringify({ id: randomUUID(), action: 'cookies', url }),
+        });
+      } catch {
+        if (signal.aborted) throw new CookieHttpError('cookie_http timed out waiting for Chrome extension or daemon; this target request was not sent');
+        unavailable = true;
+      }
+      if (unavailable || response.status === 503) {
+        if (!unavailable) await response.body?.cancel().catch(() => {});
+        if (attempt >= COOKIE_RECONNECT_DELAYS_MS.length) {
+          throw new CookieHttpError(unavailable
+            ? 'cookie_http could not reach the AutoCLI daemon after waiting; this target request was not sent'
+            : 'cookie_http Chrome extension is not connected (HTTP 503) after waiting; this target request was not sent');
+        }
+        try { await delay(COOKIE_RECONNECT_DELAYS_MS[attempt], undefined, { signal }); }
+        catch { throw new CookieHttpError('cookie_http timed out waiting for Chrome extension or daemon; this target request was not sent'); }
+        continue;
+      }
+      break;
     }
-    if (!response.ok) throw new CookieHttpError('cookie_http could not read Chrome cookies; check the daemon and extension connection');
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new CookieHttpError(`cookie_http Chrome cookie request was rejected (HTTP ${response.status}); check extension cookies and host permissions`);
+    }
     let envelope;
     try { envelope = JSON.parse(await boundedText(response, signal)); }
     catch { throw new CookieHttpError('cookie_http received an invalid cookie response from the daemon'); }
@@ -144,7 +167,7 @@ function transportFor(policy, fetchImpl, executionSignal, secrets, onWriteSubmit
 
   return async function request(input, options = {}) {
     executionSignal.throwIfAborted();
-    const signal = AbortSignal.any([executionSignal, AbortSignal.timeout(policy.timeout)]);
+    const preflightSignal = AbortSignal.any([executionSignal, AbortSignal.timeout(Math.min(policy.timeout, 30000))]);
     const url = scopedUrl(input, policy.origin);
     if (!options || typeof options !== 'object') throw new CookieHttpError('cookie_http request options are invalid');
     const method = String(options.method ?? 'GET').toUpperCase();
@@ -155,7 +178,7 @@ function transportFor(policy, fetchImpl, executionSignal, secrets, onWriteSubmit
     for (const name of ['cookie', 'authorization', 'proxy-authorization', 'host', 'origin', 'referer', policy.params.token_header]) {
       if (name && headers.has(name)) throw new CookieHttpError('cookie_http authentication headers must be supplied by the transport');
     }
-    const cookies = await cookiesFor(url.href, signal);
+    const cookies = await cookiesFor(url.href, preflightSignal);
     if (cookies.length > 0) {
       const cookieHeader = cookies.map(({ name, value }) => `${name}=${value}`).join('; ');
       secrets.add(cookieHeader);
@@ -164,7 +187,7 @@ function transportFor(policy, fetchImpl, executionSignal, secrets, onWriteSubmit
       throw new CookieHttpError('cookie_http found no matching Chrome cookies; log in to the target site');
     }
     if (policy.params.token_cookie) {
-      const tokenCookies = policy.cookieUrl === url.href ? cookies : await cookiesFor(policy.cookieUrl, signal);
+      const tokenCookies = policy.cookieUrl === url.href ? cookies : await cookiesFor(policy.cookieUrl, preflightSignal);
       const token = tokenCookies.find((cookie) => cookie.name === policy.params.token_cookie)?.value;
       if (!token && (policy.params.token_required !== false || cookies.length === 0)) {
         throw new CookieHttpError('cookie_http required login token is missing; log in to the target site');
@@ -173,6 +196,8 @@ function transportFor(policy, fetchImpl, executionSignal, secrets, onWriteSubmit
     }
     headers.set('origin', policy.origin);
     headers.set('referer', policy.cookieUrl);
+    // Connection setup must not consume the target HTTP request's timeout.
+    const signal = AbortSignal.any([executionSignal, AbortSignal.timeout(policy.timeout)]);
     let response;
     try {
       signal.throwIfAborted();
