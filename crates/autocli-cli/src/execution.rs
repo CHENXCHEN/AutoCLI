@@ -38,12 +38,38 @@ pub async fn execute_command(
 
     match result {
         Ok(inner) => inner,
-        Err(_) => Err(CliError::timeout(format!(
-            "Command '{}' timed out after {}s",
-            cmd.full_name(),
-            timeout_secs
-        ))),
+        Err(_) => Err(command_timeout_error(cmd, timeout_secs)),
     }
+}
+
+fn command_timeout_error(cmd: &CliCommand, timeout_secs: u64) -> CliError {
+    // The outer deadline may be shorter than the runner's own deadline. Once
+    // the child is cancelled we cannot know whether a permitted POST was sent.
+    let may_submit = cmd.pipeline.as_ref().is_some_and(|steps| {
+        steps.iter().any(|step| {
+            step.get("cookie_http")
+                .and_then(|policy| policy.get("allowed_requests"))
+                .and_then(Value::as_array)
+                .is_some_and(|rules| {
+                    rules.iter().any(|rule| {
+                        rule.get("method")
+                            .and_then(Value::as_str)
+                            .is_some_and(|method| !matches!(method, "GET" | "HEAD"))
+                    })
+                })
+        })
+    });
+    let uncertainty = if may_submit {
+        "; submission outcome UNKNOWN; inspect target state before retrying"
+    } else {
+        ""
+    };
+    CliError::timeout(format!(
+        "Command '{}' timed out after {}s{}",
+        cmd.full_name(),
+        timeout_secs,
+        uncertainty
+    ))
 }
 
 async fn execute_command_inner(
@@ -113,5 +139,36 @@ async fn run_command(
             "Command '{}' has no pipeline or func",
             cmd.full_name()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cookie_http_outer_deadline_preserves_submission_uncertainty() {
+        for (method, unknown) in [("GET", false), ("POST", true)] {
+            let cmd = CliCommand {
+                site: "fixture".into(),
+                name: "request".into(),
+                description: String::new(),
+                domain: None,
+                strategy: autocli_core::Strategy::Cookie,
+                browser: false,
+                browser_options: None,
+                args: vec![],
+                columns: vec![],
+                pipeline: Some(vec![serde_json::json!({"cookie_http": {
+                    "allowed_requests": [{"method": method, "path": "^/api/items$"}]
+                }})]),
+                func: None,
+                timeout_seconds: Some(1),
+                navigate_before: Default::default(),
+            };
+            let message = command_timeout_error(&cmd, 1).to_string();
+            assert_eq!(message.contains("UNKNOWN"), unknown);
+            assert_eq!(message.contains("inspect target state"), unknown);
+        }
     }
 }
