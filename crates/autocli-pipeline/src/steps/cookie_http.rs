@@ -119,14 +119,39 @@ async fn run_node(node: &OsStr, runner_source: &str, input: &Value) -> Result<Va
         Some(true) if output.status.success() => {
             Ok(envelope.get("data").cloned().unwrap_or(Value::Null))
         }
-        Some(false) => Err(CliError::pipeline(
-            envelope
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("cookie_http runtime failed"),
-        )),
+        Some(false) => Err(runtime_failure(&envelope)),
         _ => Err(CliError::pipeline("cookie_http runtime failed")),
     }
+}
+
+fn runtime_failure(envelope: &Value) -> CliError {
+    // Only the transport can attach this classification, before any business
+    // write was submitted. Unknown outcomes keep their non-retryable error.
+    if envelope.get("request_sent").and_then(Value::as_bool) == Some(false)
+        && envelope.get("submission_state").and_then(Value::as_str) != Some("UNKNOWN")
+    {
+        let reason = envelope.get("connection_reason").and_then(Value::as_str);
+        let message = match reason {
+            Some("DAEMON_UNREACHABLE") => Some("Cannot reach the AutoCLI daemon"),
+            Some("EXTENSION_NOT_CONNECTED") => Some("Chrome extension not connected"),
+            _ => None,
+        };
+        if let Some(message) = message {
+            let mut error =
+                CliError::browser_connect(format!("[CONNECTION:{}] {message}", reason.unwrap()));
+            if let CliError::BrowserConnect { suggestions, .. } = &mut error {
+                suggestions.push("Run the readiness gate from the installed AutoCLI skill in the same execution environment; the script handles connection waiting.".into());
+                suggestions.push("After readiness succeeds, retry only a read-only or dry-run command whose target request was not sent. Never automatically replay writes or UNKNOWN outcomes.".into());
+            }
+            return error;
+        }
+    }
+    CliError::pipeline(
+        envelope
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("cookie_http runtime failed"),
+    )
 }
 
 pub fn register_cookie_http_steps(registry: &mut StepRegistry) {
@@ -218,6 +243,45 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("Chrome extension is not connected"));
+    }
+
+    #[test]
+    fn connection_failures_use_the_existing_browser_error_and_renderer_contract() {
+        for (reason, message) in [
+            ("DAEMON_UNREACHABLE", "Cannot reach the AutoCLI daemon"),
+            ("EXTENSION_NOT_CONNECTED", "Chrome extension not connected"),
+        ] {
+            let error = runtime_failure(&json!({
+                "error": "private runtime detail", "connection_reason": reason, "request_sent": false
+            }));
+            assert_eq!(error.code(), "BROWSER_CONNECT");
+            assert_eq!(
+                error.to_string(),
+                format!("[browser] [CONNECTION:{reason}] {message}")
+            );
+            assert!(error
+                .suggestions()
+                .iter()
+                .any(|hint| hint.contains("readiness gate")));
+            assert!(error
+                .suggestions()
+                .iter()
+                .any(|hint| hint.contains("UNKNOWN")));
+            assert!(!error.to_string().contains("private runtime detail"));
+        }
+    }
+
+    #[test]
+    fn unknown_and_unclassified_failures_do_not_offer_connection_recovery() {
+        for envelope in [
+            json!({"error": "outcome UNKNOWN", "connection_reason": "EXTENSION_NOT_CONNECTED", "request_sent": false, "submission_state": "UNKNOWN"}),
+            json!({"error": "permission denied", "connection_reason": "PERMISSION_DENIED", "request_sent": false}),
+            json!({"error": "adapter error", "connection_reason": "EXTENSION_NOT_CONNECTED"}),
+        ] {
+            let error = runtime_failure(&envelope);
+            assert_eq!(error.code(), "PIPELINE");
+            assert!(error.suggestions().is_empty());
+        }
     }
 
     #[tokio::test]

@@ -1,15 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { Worker, isMainThread } from 'node:worker_threads';
 import { pathToFileURL } from 'node:url';
-import { setTimeout as delay } from 'node:timers/promises';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_EXECUTION_TIMEOUT_MS = 55_000;
 const MAX_TIMEOUT_MS = 600_000;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
-// Cover the extension's ~24s keepalive when a daemon was started after it.
-// The preflight signal and the whole-command deadline can stop this sooner.
-const COOKIE_RECONNECT_DELAYS_MS = [250, 500, 1000, ...Array(14).fill(2000)];
 
 class CookieHttpError extends Error {}
 
@@ -118,31 +114,24 @@ async function boundedText(response, signal) {
 function transportFor(policy, fetchImpl, executionSignal, secrets, onWriteSubmitted) {
   async function cookiesFor(url, signal) {
     let response;
-    for (let attempt = 0; ; attempt++) {
-      let unavailable = false;
-      try {
-        signal.throwIfAborted();
-        response = await fetchImpl(`http://127.0.0.1:${policy.port}/command`, {
-          method: 'POST', redirect: 'error', signal,
-          headers: { 'content-type': 'application/json', 'X-AutoCLI': '1' },
-          body: JSON.stringify({ id: randomUUID(), action: 'cookies', url }),
-        });
-      } catch {
-        if (signal.aborted) throw new CookieHttpError('cookie_http timed out waiting for Chrome extension or daemon; this target request was not sent');
-        unavailable = true;
-      }
-      if (unavailable || response.status === 503) {
-        if (!unavailable) await response.body?.cancel().catch(() => {});
-        if (attempt >= COOKIE_RECONNECT_DELAYS_MS.length) {
-          throw new CookieHttpError(unavailable
-            ? 'cookie_http could not reach the AutoCLI daemon after waiting; this target request was not sent'
-            : 'cookie_http Chrome extension is not connected (HTTP 503) after waiting; this target request was not sent');
-        }
-        try { await delay(COOKIE_RECONNECT_DELAYS_MS[attempt], undefined, { signal }); }
-        catch { throw new CookieHttpError('cookie_http timed out waiting for Chrome extension or daemon; this target request was not sent'); }
-        continue;
-      }
-      break;
+    try {
+      signal.throwIfAborted();
+      response = await fetchImpl(`http://127.0.0.1:${policy.port}/command`, {
+        method: 'POST', redirect: 'error', signal,
+        headers: { 'content-type': 'application/json', 'X-AutoCLI': '1' },
+        body: JSON.stringify({ id: randomUUID(), action: 'cookies', url }),
+      });
+    } catch {
+      if (signal.aborted) throw new CookieHttpError('cookie_http cookie request timed out; this target request was not sent');
+      const error = new CookieHttpError('cookie_http could not reach the AutoCLI daemon; this target request was not sent');
+      error.connectionReason = 'DAEMON_UNREACHABLE';
+      throw error;
+    }
+    if (response.status === 503) {
+      await response.body?.cancel().catch(() => {});
+      const error = new CookieHttpError('cookie_http Chrome extension is not connected; this target request was not sent');
+      error.connectionReason = 'EXTENSION_NOT_CONNECTED';
+      throw error;
     }
     if (!response.ok) {
       await response.body?.cancel().catch(() => {});
@@ -282,10 +271,10 @@ export async function runCookieHttp(input, { fetchImpl = globalThis.fetch } = {}
   let worker;
   let timer;
   const controller = new AbortController();
+  let writeSubmitted = false;
   try {
     if (Number(process.versions.node.split('.')[0]) < 22) throw new CookieHttpError('cookie_http requires Node.js 22 or newer');
     const policy = policyFor(input);
-    let writeSubmitted = false;
     const request = transportFor(policy, fetchImpl, controller.signal, secrets, () => { writeSubmitted = true; });
     let settled = false;
     const result = await new Promise((resolve, reject) => {
@@ -308,7 +297,15 @@ export async function runCookieHttp(input, { fetchImpl = globalThis.fetch } = {}
             const response = await request(message.input, message.options);
             if (!settled) worker.postMessage({ id: message.id, response });
           } catch (error) {
-            if (!settled) worker.postMessage({ id: message.id, error: error instanceof CookieHttpError ? error.message : 'cookie_http request failed', requestSent: error.requestSent === true });
+            if (settled) return;
+            if (error instanceof CookieHttpError && error.connectionReason) {
+              // A disconnected transport is fatal to this command. Do not let an
+              // adapter swallow it or reclassify it as a target login failure.
+              controller.abort();
+              reject(error);
+            } else {
+              worker.postMessage({ id: message.id, error: error instanceof CookieHttpError ? error.message : 'cookie_http request failed', requestSent: error.requestSent === true });
+            }
           }
         }
       });
@@ -320,6 +317,12 @@ export async function runCookieHttp(input, { fetchImpl = globalThis.fetch } = {}
     catch { throw new CookieHttpError('cookie_http adapter result must be JSON serializable'); }
     return { ok: true, data: redact(normalized) };
   } catch (error) {
+    if (error instanceof CookieHttpError && error.connectionReason) {
+      if (writeSubmitted) {
+        return { ok: false, error: redact(error.message + '; submission outcome UNKNOWN; inspect target state before retrying'), submission_state: 'UNKNOWN' };
+      }
+      return { ok: false, error: redact(error.message), connection_reason: error.connectionReason, request_sent: false };
+    }
     return { ok: false, error: redact(error?.message || 'cookie_http evaluation failed') };
   } finally {
     clearTimeout(timer);

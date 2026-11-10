@@ -62,34 +62,40 @@ test('reads cookies fresh for each precise API URL', async () => {
   ]);
 });
 
-test('waits for an extension reconnect before sending a business POST once', async () => {
-  let cookieReads = 0;
-  const fake = fakeTransport();
-  const result = await runCookieHttp(input(`fetch('${origin}/api/items', {method: 'POST', body: 'write'}).then(r => r.json())`, {
-    allowed_requests: [{method: 'POST', path: '^/api/items$'}],
-  }), { fetchImpl: async (url, options) => {
-    if (url.endsWith('/command') && ++cookieReads === 1) return Response.json({error: 'Chrome extension not connected'}, {status: 503});
-    return fake.fetch(url, options);
-  } });
-  assert.equal(result.ok, true);
-  assert.equal(cookieReads, 2);
-  assert.equal(fake.calls.filter(call => call.url.startsWith(origin)).length, 1);
-});
-
-test('retries a daemon connection failure without retrying a failed business POST', async () => {
+test('extension disconnect fails after one cookie read without sending a business POST', async () => {
   let cookieReads = 0;
   let submissions = 0;
-  const fake = fakeTransport({api: () => { submissions++; throw new Error('target connection lost'); }});
   const result = await runCookieHttp(input(`fetch('${origin}/api/items', {method: 'POST', body: 'write'})`, {
     allowed_requests: [{method: 'POST', path: '^/api/items$'}],
-  }), { fetchImpl: async (url, options) => {
-    if (url.endsWith('/command') && ++cookieReads === 1) throw new TypeError('fetch failed');
-    return fake.fetch(url, options);
-  } });
+  }), {fetchImpl: async (url) => {
+    if (url.endsWith('/command')) {
+      cookieReads++;
+      return Response.json({error: 'private daemon payload'}, {status: 503});
+    }
+    submissions++;
+    return Response.json({});
+  }});
   assert.equal(result.ok, false);
-  assert.match(result.error, /not retried/);
-  assert.equal(cookieReads, 2);
-  assert.equal(submissions, 1);
+  assert.equal(result.connection_reason, 'EXTENSION_NOT_CONNECTED');
+  assert.equal(result.request_sent, false);
+  assert.doesNotMatch(result.error, /private daemon payload/);
+  assert.equal(cookieReads, 1);
+  assert.equal(submissions, 0);
+});
+
+test('daemon connection failure fails after one attempt without sending a business POST', async () => {
+  let calls = 0;
+  const result = await runCookieHttp(input(`fetch('${origin}/api/items', {method: 'POST', body: 'write'})`, {
+    allowed_requests: [{method: 'POST', path: '^/api/items$'}],
+  }), {fetchImpl: async () => {
+    calls++;
+    throw new TypeError('private network detail');
+  }});
+  assert.equal(result.ok, false);
+  assert.equal(result.connection_reason, 'DAEMON_UNREACHABLE');
+  assert.equal(result.request_sent, false);
+  assert.doesNotMatch(result.error, /private network detail/);
+  assert.equal(calls, 1);
 });
 
 test('permission rejections fail immediately without reflecting daemon payloads', async () => {
@@ -103,23 +109,47 @@ test('permission rejections fail immediately without reflecting daemon payloads'
     assert.match(result.error, new RegExp('HTTP ' + status));
     assert.doesNotMatch(result.error, /private daemon payload/);
     assert.equal(calls, 1);
+    assert.equal(result.connection_reason, undefined);
   }
 });
 
-test('extension reconnect wait is cancelled before any target request is submitted', async () => {
-  let calls = 0;
-  const script = `(async () => { try { await fetch('${origin}/api/items'); }
-    catch (error) { return {submitted: error.cookieHttpRequestSent, message: error.message}; } })()`;
-  const started = Date.now();
-  const result = await runCookieHttp(input(script, {timeout_ms: 80, execution_timeout_ms: 2000}), {fetchImpl: async () => {
-    calls++;
-    return Response.json({error: 'Chrome extension not connected'}, {status: 503});
+test('adapters cannot swallow or relabel a disconnected cookie transport', async () => {
+  for (const catchBody of ["return 'ignored'", "throw new Error('please log in')"]) {
+    let calls = 0;
+    const script = `(async () => { try { await fetch('${origin}/api/items'); }
+      catch (error) { ${catchBody}; } })()`;
+    const result = await runCookieHttp(input(script), {fetchImpl: async () => {
+      calls++;
+      return Response.json({}, {status: 503});
+    }});
+    assert.equal(result.ok, false);
+    assert.equal(result.connection_reason, 'EXTENSION_NOT_CONNECTED');
+    assert.doesNotMatch(result.error, /please log in|ignored/);
+    assert.equal(calls, 1);
+  }
+});
+
+test('a connection failure after a submitted write reports UNKNOWN without retry classification', async () => {
+  let cookieReads = 0;
+  let submissions = 0;
+  const fake = fakeTransport({api: () => { submissions++; return Response.json({saved: true}); }});
+  const script = `(async () => {
+    await fetch('${origin}/api/items', {method: 'POST', body: 'write'});
+    return fetch('${origin}/api/items');
+  })()`;
+  const result = await runCookieHttp(input(script, {
+    allowed_requests: [{method: 'POST', path: '^/api/items$'}, {method: 'GET', path: '^/api/items$'}],
+  }), {fetchImpl: async (url, options) => {
+    if (url.endsWith('/command') && ++cookieReads === 2) return Response.json({}, {status: 503});
+    return fake.fetch(url, options);
   }});
-  assert.equal(result.ok, true);
-  assert.equal(result.data.submitted, false);
-  assert.match(result.data.message, /timed out waiting for Chrome extension/);
-  assert.equal(calls, 1);
-  assert.ok(Date.now() - started < 1500);
+  assert.equal(result.ok, false);
+  assert.equal(result.submission_state, 'UNKNOWN');
+  assert.equal(result.connection_reason, undefined);
+  assert.equal(result.request_sent, undefined);
+  assert.match(result.error, /submission outcome UNKNOWN/);
+  assert.equal(cookieReads, 2);
+  assert.equal(submissions, 1);
 });
 
 test('business HTTP 503 is returned once without cookie retry', async () => {
@@ -129,8 +159,7 @@ test('business HTTP 503 is returned once without cookie retry', async () => {
   assert.equal(fake.calls.length, 2);
 });
 
-test('extension reconnect waiting does not consume the target HTTP timeout', async () => {
-  let cookieReads = 0;
+test('cookie retrieval does not consume the target HTTP timeout', async () => {
   const fake = fakeTransport({api: async (_url, options) => {
     await new Promise((resolve, reject) => {
       const timer = setTimeout(resolve, 350);
@@ -138,14 +167,18 @@ test('extension reconnect waiting does not consume the target HTTP timeout', asy
     });
     return Response.json({items: [1, 2]});
   }});
+  let cookieReads = 0;
   const result = await runCookieHttp(input(requestScript, {timeout_ms: 500, execution_timeout_ms: 2000}), {
     fetchImpl: async (url, options) => {
-      if (url.endsWith('/command') && ++cookieReads === 1) return Response.json({}, {status: 503});
+      if (url.endsWith('/command')) {
+        cookieReads++;
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
       return fake.fetch(url, options);
     },
   });
   assert.equal(result.ok, true);
-  assert.equal(cookieReads, 2);
+  assert.equal(cookieReads, 1);
   assert.equal(fake.calls.filter(call => call.url.startsWith(origin)).length, 1);
 });
 
@@ -195,6 +228,7 @@ test('missing cookies or required token fails before the target request', async 
     const result = await runCookieHttp(input(requestScript, { token_cookie: 'PROD_AUTH_TOKEN', token_header: 'token' }), { fetchImpl: fake.fetch });
     assert.equal(result.ok, false);
     assert.equal(fake.calls.filter((item) => item.url.startsWith(origin)).length, 0);
+    assert.equal(result.connection_reason, undefined);
   }
 });
 
