@@ -1898,6 +1898,22 @@ async function listTabGroupWebTabs(cmd: Command, workspace: string): Promise<chr
   );
 }
 
+async function assertOwnedTabForClose(cmd: Command, workspace: string, tabId: number): Promise<void> {
+  const title = getGroupTitle(cmd);
+  const key = getTabGroupSessionKey(title);
+  const session = await getExistingTabGroupSession(key);
+  if (!session || !session.ownedTabIds.has(tabId) || session.tabWorkspaceOwners.get(tabId) !== workspace) {
+    throw new Error(`strict-background-tab-not-owned: Tab ${tabId} is not owned by workspace ${workspace}`);
+  }
+  const groups = await findUniqueTabGroupsByTitle(title);
+  const tab = await chrome.tabs.get(tabId);
+  if (tabGroupSessions.get(key) !== session || !session.ownedTabIds.has(tabId)
+      || session.tabWorkspaceOwners.get(tabId) !== workspace
+      || groups.length !== 1 || groups[0].id !== session.groupId || tab.groupId !== session.groupId) {
+    throw new Error(`strict-background-stale-tab: Tab ${tabId} is no longer in group ${title}`);
+  }
+}
+
 async function removeOwnedTab(cmd: Command, workspace: string, tabId: number): Promise<void> {
   if (!isTabGroupCarrier(cmd)) return;
   const title = getGroupTitle(cmd);
@@ -2084,6 +2100,7 @@ async function handleTabs(cmd: Command, workspace: string): Promise<Result> {
           : await listAutomationWebTabs(workspace);
         const target = tabs[cmd.index];
         if (!target?.id) return { id: cmd.id, ok: false, error: `Tab index ${cmd.index} not found` };
+        if (isTabGroupCarrier(cmd)) await assertOwnedTabForClose(cmd, workspace, target.id);
         await chrome.tabs.remove(target.id);
         await executor.detach(target.id);
         await removeOwnedTab(cmd, workspace, target.id);
@@ -2098,6 +2115,7 @@ async function handleTabs(cmd: Command, workspace: string): Promise<Result> {
         cmd = { ...cmd, tabId: boundTabId };
       }
       const tabId = await resolveTabId(cmd.tabId, workspace, undefined, cmd);
+      if (isTabGroupCarrier(cmd)) await assertOwnedTabForClose(cmd, workspace, tabId);
       await chrome.tabs.remove(tabId);
       await executor.detach(tabId);
       await removeOwnedTab(cmd, workspace, tabId);

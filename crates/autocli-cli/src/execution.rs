@@ -30,16 +30,8 @@ pub async fn execute_command(
 
     let timeout_secs = command_timeout(cmd);
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        execute_command_inner(cmd, kwargs),
-    )
-    .await;
-
-    match result {
-        Ok(inner) => inner,
-        Err(_) => Err(command_timeout_error(cmd, timeout_secs)),
-    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    execute_command_inner(cmd, kwargs, deadline, timeout_secs).await
 }
 
 fn command_timeout_error(cmd: &CliCommand, timeout_secs: u64) -> CliError {
@@ -75,6 +67,8 @@ fn command_timeout_error(cmd: &CliCommand, timeout_secs: u64) -> CliError {
 async fn execute_command_inner(
     cmd: &CliCommand,
     kwargs: HashMap<String, Value>,
+    deadline: tokio::time::Instant,
+    timeout_secs: u64,
 ) -> Result<Value, CliError> {
     // Build step registry
     let mut registry = StepRegistry::new();
@@ -84,43 +78,49 @@ async fn execute_command_inner(
         // Browser session
         let mut bridge =
             BrowserBridge::new(daemon_port()).with_browser_options(cmd.browser_options.clone());
-        let page = bridge.connect().await?;
-
-        // Pre-navigate to domain if set, but ONLY if the pipeline doesn't
-        // start with its own navigate step (to avoid double navigation).
-        let pipeline_starts_with_navigate = cmd
-            .pipeline
-            .as_ref()
-            .and_then(|steps| steps.first())
-            .and_then(|step| step.as_object())
-            .map_or(false, |obj| obj.contains_key("navigate"));
-
-        if !pipeline_starts_with_navigate {
-            if let Some(domain) = &cmd.domain {
-                let url = format!("https://{}", domain);
-                tracing::debug!(url = %url, "Pre-navigating to domain");
-                page.goto(&url, None).await?;
-            }
-        }
-
-        // Execute
-        let result = if let Some(ref steps) = cmd.pipeline {
-            execute_pipeline(Some(page.clone()), steps, &kwargs, &registry).await
-        } else if cmd.func.is_some() {
-            run_command(cmd, Some(page.clone()), &kwargs, &registry).await
-        } else {
-            Err(CliError::command_execution(format!(
-                "Command '{}' has no pipeline or func",
-                cmd.full_name()
-            )))
+        let page = match tokio::time::timeout_at(deadline, bridge.connect_daemon_page()).await {
+            Ok(result) => result?,
+            Err(_) => return Err(command_timeout_error(cmd, timeout_secs)),
         };
 
-        // Close the automation tab/window after command completes
-        let _ = page.close().await;
+        let result = tokio::time::timeout_at(deadline, async {
+            let pipeline_starts_with_navigate = cmd
+                .pipeline
+                .as_ref()
+                .and_then(|steps| steps.first())
+                .and_then(|step| step.as_object())
+                .map_or(false, |obj| obj.contains_key("navigate"));
+
+            if !pipeline_starts_with_navigate {
+                if let Some(domain) = &cmd.domain {
+                    let url = format!("https://{}", domain);
+                    tracing::debug!(url = %url, "Pre-navigating to domain");
+                    page.goto(&url, None).await?;
+                }
+            }
+            run_command(cmd, Some(page.clone()), &kwargs, &registry).await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(CliError::browser_execution_timeout(format!(
+                "Command '{}' timed out after {}s; outcome UNKNOWN",
+                cmd.full_name(),
+                timeout_secs
+            )))
+        });
+
+        if matches!(result, Err(CliError::BrowserExecutionTimeout { .. })) {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), page.discard()).await;
+        } else {
+            let _ = tokio::time::timeout_at(deadline, page.close()).await;
+        }
 
         result
     } else {
-        run_command(cmd, None, &kwargs, &registry).await
+        match tokio::time::timeout_at(deadline, run_command(cmd, None, &kwargs, &registry)).await {
+            Ok(result) => result,
+            Err(_) => Err(command_timeout_error(cmd, timeout_secs)),
+        }
     }
 }
 

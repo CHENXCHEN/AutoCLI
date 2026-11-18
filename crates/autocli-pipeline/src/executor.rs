@@ -24,9 +24,9 @@ pub async fn execute_pipeline(
     let mut data = Value::Null;
 
     for (i, step) in pipeline.iter().enumerate() {
-        let obj = step.as_object().ok_or_else(|| {
-            CliError::pipeline(format!("Step {i} is not an object: {step}"))
-        })?;
+        let obj = step
+            .as_object()
+            .ok_or_else(|| CliError::pipeline(format!("Step {i} is not an object: {step}")))?;
 
         if obj.len() != 1 {
             return Err(CliError::pipeline(format!(
@@ -45,16 +45,20 @@ pub async fn execute_pipeline(
         let mut last_error: Option<CliError> = None;
 
         for attempt in 0..if is_browser { MAX_BROWSER_ATTEMPTS } else { 1 } {
-            match handler
-                .execute(page.clone(), params, &data, args)
-                .await
-            {
+            match handler.execute(page.clone(), params, &data, args).await {
                 Ok(result) => {
                     data = result;
                     last_error = None;
                     break;
                 }
                 Err(e) => {
+                    if matches!(
+                        e,
+                        CliError::BrowserExecutionTimeout { .. }
+                            | CliError::BrowserOutcomeUnknown { .. }
+                    ) {
+                        return Err(e);
+                    }
                     if is_browser && attempt + 1 < MAX_BROWSER_ATTEMPTS {
                         warn!(
                             step = step_name,
@@ -135,6 +139,32 @@ mod tests {
     struct FlakyBrowserStep {
         fail_count: AtomicUsize,
         fail_times: usize,
+    }
+
+    struct UnknownBrowserStep(AtomicUsize, bool);
+
+    #[async_trait]
+    impl StepHandler for UnknownBrowserStep {
+        fn name(&self) -> &'static str {
+            "unknown_browser"
+        }
+        fn is_browser_step(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _page: Option<Arc<dyn IPage>>,
+            _params: &Value,
+            _data: &Value,
+            _args: &HashMap<String, Value>,
+        ) -> Result<Value, CliError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(if self.1 {
+                CliError::browser_execution_timeout("execution timed out")
+            } else {
+                CliError::browser_outcome_unknown("outcome UNKNOWN")
+            })
+        }
     }
 
     impl FlakyBrowserStep {
@@ -221,7 +251,10 @@ mod tests {
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("nonexistent"), "Error should mention the step name: {msg}");
+        assert!(
+            msg.contains("nonexistent"),
+            "Error should mention the step name: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -235,6 +268,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn browser_step_does_not_retry_unknown_outcomes() {
+        for timeout in [false, true] {
+            let mut registry = StepRegistry::new();
+            let step = Arc::new(UnknownBrowserStep(AtomicUsize::new(0), timeout));
+            registry.register(step.clone());
+            let error = execute_pipeline(
+                None,
+                &[json!({"unknown_browser": null})],
+                &empty_args(),
+                &registry,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                CliError::BrowserOutcomeUnknown { .. } | CliError::BrowserExecutionTimeout { .. }
+            ));
+            assert_eq!(step.0.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]

@@ -33,6 +33,12 @@ fn daemon_failure_from_unprocessable_entity(body: &str) -> Option<CliError> {
     )))
 }
 
+fn uncertain_on_response_failure(cmd: &DaemonCommand) -> bool {
+    cmd.action == "exec"
+        || cmd.action == "close-window"
+        || (cmd.action == "tabs" && cmd.op.as_deref() == Some("close"))
+}
+
 impl DaemonClient {
     /// Create a new client pointing at the given port on localhost.
     pub fn new(port: u16) -> Self {
@@ -70,9 +76,14 @@ impl DaemonClient {
 
                     if status.is_success() {
                         let daemon_result: DaemonResult = resp.json().await.map_err(|e| {
-                            CliError::browser_connect(format!(
-                                "Failed to parse daemon response: {e}"
-                            ))
+                            let message = format!("Failed to parse daemon response: {e}");
+                            if uncertain_on_response_failure(&cmd) {
+                                CliError::browser_outcome_unknown(format!(
+                                    "Command outcome UNKNOWN: {message}"
+                                ))
+                            } else {
+                                CliError::browser_connect(message)
+                            }
                         })?;
                         if daemon_result.ok {
                             return Ok(daemon_result.data.unwrap_or(Value::Null));
@@ -101,9 +112,33 @@ impl DaemonClient {
 
                     // 5xx / other errors — retryable
                     let body = resp.text().await.unwrap_or_default();
+                    if uncertain_on_response_failure(&cmd) {
+                        let message = format!(
+                            "Command outcome UNKNOWN for action {} after HTTP {status}: {body}",
+                            cmd.action
+                        );
+                        return Err(
+                            if cmd.action == "exec"
+                                && status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                            {
+                                CliError::browser_execution_timeout(message)
+                            } else {
+                                CliError::browser_outcome_unknown(message)
+                            },
+                        );
+                    }
                     last_err = Some(format!("HTTP {status}: {body}"));
                 }
                 Err(e) => {
+                    if uncertain_on_response_failure(&cmd) && !e.is_connect() {
+                        let message =
+                            format!("Command outcome UNKNOWN for action {}: {e}", cmd.action);
+                        return Err(if cmd.action == "exec" && e.is_timeout() {
+                            CliError::browser_execution_timeout(message)
+                        } else {
+                            CliError::browser_outcome_unknown(message)
+                        });
+                    }
                     // Network error — retryable
                     last_err = Some(format!("Request error: {e}"));
                 }
@@ -170,6 +205,119 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unknown_execution_and_close_are_not_replayed() {
+        use axum::{http::StatusCode, routing::post, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let received = requests.clone();
+        let app = Router::new().route(
+            "/command",
+            post(move || {
+                let received = received.clone();
+                async move {
+                    received.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DaemonClient::new(port);
+        for command in [
+            DaemonCommand::new("exec"),
+            DaemonCommand::new("tabs").with_op("close"),
+            DaemonCommand::new("close-window"),
+        ] {
+            assert!(matches!(
+                client.send_command(command).await,
+                Err(CliError::BrowserOutcomeUnknown { .. })
+            ));
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execution_422_remains_a_command_error() {
+        use axum::{http::StatusCode, routing::post, Router};
+
+        let app = Router::new().route(
+            "/command",
+            post(|| async {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    r#"{"id":"test","ok":false,"error":"script failed"}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let error = DaemonClient::new(port)
+            .send_command(DaemonCommand::new("exec"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CliError::CommandExecution { .. }));
+        assert!(error.to_string().contains("script failed"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn daemon_504_is_execution_timeout_only_for_exec() {
+        use axum::{http::StatusCode, routing::post, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let received = count.clone();
+        let app = Router::new().route(
+            "/command",
+            post(move || {
+                let received = received.clone();
+                async move {
+                    received.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        r#"{"error":"Command timed out"}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DaemonClient::new(port);
+        assert!(matches!(
+            client.send_command(DaemonCommand::new("exec")).await,
+            Err(CliError::BrowserExecutionTimeout { .. })
+        ));
+        assert!(matches!(
+            client
+                .send_command(DaemonCommand::new("tabs").with_op("close"))
+                .await,
+            Err(CliError::BrowserOutcomeUnknown { .. })
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[test]
+    fn script_timeout_message_is_a_returned_command_error() {
+        let error = daemon_failure_from_unprocessable_entity(
+            r#"{"id":"test","ok":false,"error":"Error: Timeout waiting for selector: #missing"}"#,
+        )
+        .unwrap();
+        assert!(matches!(error, CliError::CommandExecution { .. }));
+    }
 
     #[test]
     fn test_daemon_client_construction() {

@@ -119,6 +119,24 @@ impl DaemonPage {
         self.send(cmd).await
     }
 
+    pub async fn discard(&self) -> Result<(), CliError> {
+        if self.browser_config.carrier != BrowserCarrier::TabGroupBackground {
+            return Err(CliError::command_execution(
+                "Cannot discard a shared automation window",
+            ));
+        }
+        let cmd = self.cmd("tabs").await.with_op("close");
+        let tab_id = cmd
+            .tab_id
+            .ok_or_else(|| CliError::command_execution("Cannot discard without a confirmed tab"))?;
+        self.send(cmd).await?;
+        let mut cached = self.tab_id.write().await;
+        if *cached == Some(tab_id) {
+            *cached = None;
+        }
+        Ok(())
+    }
+
     /// Navigate to `url`, run Readability in the page, and return the parsed article.
     ///
     /// Returns an error (rather than falling back) when Readability cannot
@@ -442,6 +460,36 @@ mod tests {
         assert_eq!(tabs[0].id, "42");
         assert!(contains_tab_id(&tabs, 42));
         assert!(!contains_tab_id(&tabs, 7));
+    }
+
+    #[tokio::test]
+    async fn discard_requires_strict_carrier_and_confirmed_tab() {
+        let client = Arc::new(DaemonClient::new(0));
+        let shared = DaemonPage::new(client.clone(), "workspace");
+        *shared.tab_id.write().await = Some(42);
+        assert!(shared
+            .discard()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("shared"));
+        assert_eq!(*shared.tab_id.read().await, Some(42));
+
+        let strict = DaemonPage::new_with_browser_config(
+            client,
+            "workspace",
+            BrowserConfig {
+                carrier: BrowserCarrier::TabGroupBackground,
+                group_name: Some("work".to_string()),
+                group_idle_timeout_seconds: None,
+            },
+        );
+        assert!(strict
+            .discard()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("confirmed tab"));
     }
 
     #[tokio::test]

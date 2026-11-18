@@ -595,6 +595,29 @@ describe('background tab isolation', () => {
     expect(foreignClose).toEqual(expect.objectContaining({ ok: false, error: expect.stringContaining('strict-background-tab-not-owned:') }));
   });
 
+  it('refuses to close a tab moved after ownership resolution', async () => {
+    const { chrome, tabs } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const base = { action: 'tabs' as const, carrier: 'tab-group-background' as const, groupName: 'work', workspace: 'site:twitter' };
+    const created = await mod.__test__.handleCommand({ id: 'move-create', ...base, op: 'new', url: 'https://example.test' });
+    const tabId = (created.data as { tabId: number }).tabId;
+    const originalGet = chrome.tabs.get.getMockImplementation()!;
+    let count = 0;
+    chrome.tabs.get.mockImplementation(async (id: number) => {
+      const tab = await originalGet(id);
+      if (id === tabId && ++count === 2) {
+        const target = tabs.find((item) => item.id === tabId)!;
+        target.groupId = -1;
+      }
+      return tab;
+    });
+    const result = await mod.__test__.handleCommand({ id: 'move-close', ...base, op: 'close', tabId });
+    expect(result.ok).toBe(false);
+    expect(tabs.some((tab) => tab.id === tabId)).toBe(true);
+    expect(chrome.tabs.remove).not.toHaveBeenCalledWith(tabId);
+  });
+
   it('does not create a strict-background group for list or close without an owned tab', async () => {
     const { chrome, groups, create } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

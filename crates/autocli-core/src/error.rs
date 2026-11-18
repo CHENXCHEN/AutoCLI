@@ -46,6 +46,18 @@ pub enum CliError {
         suggestions: Vec<String>,
     },
 
+    #[error("[timeout] {message}")]
+    BrowserExecutionTimeout {
+        message: String,
+        suggestions: Vec<String>,
+    },
+
+    #[error("[browser] {message}")]
+    BrowserOutcomeUnknown {
+        message: String,
+        suggestions: Vec<String>,
+    },
+
     #[error("[argument] {message}")]
     Argument {
         message: String,
@@ -101,6 +113,8 @@ impl CliError {
             Self::Config { .. } => "CONFIG",
             Self::AuthRequired { .. } => "AUTH_REQUIRED",
             Self::Timeout { .. } => "TIMEOUT",
+            Self::BrowserExecutionTimeout { .. } => "BROWSER_EXECUTION_TIMEOUT",
+            Self::BrowserOutcomeUnknown { .. } => "BROWSER_OUTCOME_UNKNOWN",
             Self::Argument { .. } => "ARGUMENT",
             Self::EmptyResult { .. } => "EMPTY_RESULT",
             Self::Selector { .. } => "SELECTOR",
@@ -120,6 +134,8 @@ impl CliError {
             Self::Config { .. } => "⚙️",
             Self::AuthRequired { .. } => "🔒",
             Self::Timeout { .. } => "⏱️",
+            Self::BrowserExecutionTimeout { .. } => "⏱️",
+            Self::BrowserOutcomeUnknown { .. } => "🌐",
             Self::Argument { .. } => "📝",
             Self::EmptyResult { .. } => "📭",
             Self::Selector { .. } => "🎯",
@@ -139,6 +155,8 @@ impl CliError {
             | Self::Config { suggestions, .. }
             | Self::AuthRequired { suggestions, .. }
             | Self::Timeout { suggestions, .. }
+            | Self::BrowserExecutionTimeout { suggestions, .. }
+            | Self::BrowserOutcomeUnknown { suggestions, .. }
             | Self::Argument { suggestions, .. }
             | Self::EmptyResult { suggestions, .. }
             | Self::Selector { suggestions, .. }
@@ -167,6 +185,20 @@ impl CliError {
 
     pub fn timeout(msg: impl Into<String>) -> Self {
         Self::Timeout {
+            message: msg.into(),
+            suggestions: vec![],
+        }
+    }
+
+    pub fn browser_execution_timeout(msg: impl Into<String>) -> Self {
+        Self::BrowserExecutionTimeout {
+            message: msg.into(),
+            suggestions: vec![],
+        }
+    }
+
+    pub fn browser_outcome_unknown(msg: impl Into<String>) -> Self {
+        Self::BrowserOutcomeUnknown {
             message: msg.into(),
             suggestions: vec![],
         }
