@@ -1,0 +1,56 @@
+name: Build v0.3.9 macOS recovery assets
+
+on:
+  push:
+    branches:
+      - codex/release-v039-macos-recovery
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 21fc5c7b1ffd1e43e8ae2330fdafcd1314a439df
+
+      - name: Check release tag
+        run: |
+          test "$(git ls-remote origin refs/tags/v0.3.9 | cut -f1)" = "21fc5c7b1ffd1e43e8ae2330fdafcd1314a439df"
+          test "$(git rev-parse HEAD)" = "21fc5c7b1ffd1e43e8ae2330fdafcd1314a439df"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../autocli-${{ matrix.target }}.tar.gz autocli
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: autocli-${{ matrix.target }}
+          path: autocli-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
