@@ -69,7 +69,7 @@ A **complete rewrite in pure Rust** based on [OpenCLI](https://github.com/jackwe
 ### One-line Install Script (macOS / Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nashsu/autocli/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/CHENXCHEN/AutoCLI/main/scripts/install.sh | sh
 ```
 
 Automatically detects your system and architecture, downloads the corresponding binary, and installs to `/usr/local/bin/`.
@@ -77,7 +77,7 @@ Automatically detects your system and architecture, downloads the corresponding 
 ### Windows (PowerShell)
 
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/nashsu/autocli/releases/latest/download/autocli-x86_64-pc-windows-msvc.zip" -OutFile autocli.zip
+Invoke-WebRequest -Uri "https://github.com/CHENXCHEN/AutoCLI/releases/latest/download/autocli-x86_64-pc-windows-msvc.zip" -OutFile autocli.zip
 Expand-Archive autocli.zip -DestinationPath .
 Move-Item autocli.exe "$env:LOCALAPPDATA\Microsoft\WindowsApps\"
 ```
@@ -85,7 +85,7 @@ Move-Item autocli.exe "$env:LOCALAPPDATA\Microsoft\WindowsApps\"
 
 ### Manual Download (Simplest)
 
-Download the file for your platform from [GitHub Releases](https://github.com/nashsu/autocli/releases/latest):
+Download the file for your platform from [GitHub Releases](https://github.com/CHENXCHEN/AutoCLI/releases/latest):
 
 | Platform | File |
 |------|------|
@@ -100,7 +100,7 @@ After extracting, place `autocli` (or `autocli.exe` on Windows) in your system P
 ### Build from Source
 
 ```bash
-git clone https://github.com/nashsu/autocli.git
+git clone https://github.com/CHENXCHEN/AutoCLI.git
 cd autocli
 cargo build --release
 cp target/release/autocli /usr/local/bin/   # macOS / Linux
@@ -112,7 +112,7 @@ Simply re-run the install command or download the latest release to overwrite th
 
 ### Chrome Extension Setup (required for browser commands)
 
-1. Download `autocli-chrome-extension.zip` from [GitHub Releases](https://github.com/nashsu/autocli/releases/latest)
+1. Download `autocli-chrome-extension.zip` from [GitHub Releases](https://github.com/CHENXCHEN/AutoCLI/releases/latest)
 2. Extract to any directory
 3. Open Chrome and go to `chrome://extensions`
 4. Enable "Developer mode" (top right toggle)

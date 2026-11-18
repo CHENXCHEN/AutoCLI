@@ -1,10 +1,10 @@
 #!/bin/sh
 # autocli installer — detects OS/Arch and downloads the right binary
-# Usage: curl -fsSL https://raw.githubusercontent.com/nashsu/autocli/main/scripts/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/CHENXCHEN/AutoCLI/main/scripts/install.sh | sh
 
 set -e
 
-REPO="nashsu/autocli"
+REPO="CHENXCHEN/AutoCLI"
 INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="autocli"
 
@@ -37,6 +37,10 @@ esac
 
 TARGET="${ARCH}-${OS}"
 
+if [ "$TARGET" = "aarch64-pc-windows-msvc" ]; then
+    error "Unsupported architecture for Windows: ${ARCH}"
+fi
+
 # Get latest version (via redirect, avoids API rate limit)
 info "Detecting latest version..."
 VERSION=$(curl -fsSI "https://github.com/${REPO}/releases/latest" | grep -i "location:" | sed -E 's/.*\/tag\/(.*)/\1/' | tr -d '\r\n')
@@ -49,6 +53,7 @@ info "Latest version: ${VERSION}"
 if echo "$OS" | grep -q "windows"; then
     EXT="zip"
     ARCHIVE="${BINARY_NAME}-${TARGET}.zip"
+    BINARY_NAME="autocli.exe"
 else
     EXT="tar.gz"
     ARCHIVE="${BINARY_NAME}-${TARGET}.tar.gz"

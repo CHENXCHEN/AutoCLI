@@ -803,18 +803,22 @@ async fn handle_ai_stream_socket(mut socket: WebSocket) {
 
 /// Compare semver: returns true if `latest` is newer than `current`.
 fn is_newer_version(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split('.').filter_map(|s| s.parse().ok()).collect()
+    let parse = |version: &str| -> Option<[u32; 3]> {
+        let mut components = version.trim_start_matches('v').split('.');
+        let result = [
+            components.next()?.parse().ok()?,
+            components.next()?.parse().ok()?,
+            components.next()?.parse().ok()?,
+        ];
+        if components.next().is_some() {
+            return None;
+        }
+        Some(result)
     };
-    let l = parse(latest);
-    let c = parse(current);
-    for i in 0..3 {
-        let lv = l.get(i).copied().unwrap_or(0);
-        let cv = c.get(i).copied().unwrap_or(0);
-        if lv > cv { return true; }
-        if lv < cv { return false; }
+    match (parse(latest), parse(current)) {
+        (Some(latest), Some(current)) => latest > current,
+        _ => false,
     }
-    false
 }
 
 // ─── Update check ───────────────────────────────────────────────
@@ -825,12 +829,23 @@ fn update_cache() -> &'static tokio::sync::RwLock<Option<serde_json::Value>> {
     CACHED_UPDATE.get_or_init(|| tokio::sync::RwLock::new(None))
 }
 
-async fn check_and_cache_update() {
-    let api_base = std::env::var("AUTOCLI_API_BASE")
-        .unwrap_or_else(|_| "https://www.autocli.ai".to_string());
-    let url = format!("{}/api/version/latest", api_base.trim_end_matches('/'));
+fn release_update_info(data: &serde_json::Value, current: &str) -> Option<serde_json::Value> {
+    let latest = data.get("tag_name")?.as_str()?;
+    if latest.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "current_version": current,
+        "latest_version": latest,
+        "download_url": data.get("html_url").and_then(|v| v.as_str()).unwrap_or("https://github.com/CHENXCHEN/AutoCLI/releases"),
+        "published_at": data.get("published_at").and_then(|v| v.as_str()).unwrap_or(""),
+        "update_available": is_newer_version(latest, current),
+    }))
+}
 
+async fn check_and_cache_update() {
     let client = match reqwest::Client::builder()
+        .user_agent(concat!("autocli/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(10))
         .build()
     {
@@ -838,23 +853,18 @@ async fn check_and_cache_update() {
         Err(_) => return,
     };
 
-    match client.get(&url).send().await {
+    match client
+        .get("https://api.github.com/repos/CHENXCHEN/AutoCLI/releases/latest")
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(data) = resp.json::<serde_json::Value>().await {
                 let current = env!("CARGO_PKG_VERSION");
-                let latest = data.get("version").and_then(|v| v.as_str()).unwrap_or("");
-                let latest_clean = latest.strip_prefix('v').unwrap_or(latest);
-
-                let mut cached = json!({
-                    "current_version": current,
-                    "latest_version": latest,
-                    "download_url": data.get("download_url").and_then(|v| v.as_str()).unwrap_or(""),
-                    "published_at": data.get("published_at").and_then(|v| v.as_str()).unwrap_or(""),
-                    "update_available": is_newer_version(latest_clean, current),
-                });
-
-                *update_cache().write().await = Some(cached);
-                tracing::debug!(current, latest, "Update check completed");
+                if let Some(cached) = release_update_info(&data, current) {
+                    *update_cache().write().await = Some(cached);
+                    tracing::debug!(current, "Update check completed");
+                }
             }
         }
         _ => {
@@ -881,6 +891,36 @@ mod tests {
     use super::*;
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as ClientMessage};
+
+    #[test]
+    fn release_versions_compare_as_three_numeric_components() {
+        assert!(is_newer_version("v0.3.10", "0.3.9"));
+        assert!(is_newer_version("v1.0.0", "0.9.9"));
+        assert!(!is_newer_version("v0.3.9", "0.3.9"));
+        assert!(!is_newer_version("v0.3.8", "0.3.9"));
+        assert!(!is_newer_version("v0.3.10-rc.1", "0.3.9"));
+        assert!(!is_newer_version("broken", "0.3.9"));
+    }
+
+    #[test]
+    fn github_release_maps_to_existing_update_response() {
+        let data = json!({
+            "tag_name": "v0.4.0",
+            "html_url": "https://github.com/CHENXCHEN/AutoCLI/releases/tag/v0.4.0",
+            "published_at": "2026-11-18T00:00:00Z"
+        });
+        assert_eq!(
+            release_update_info(&data, "0.3.9"),
+            Some(json!({
+                "current_version": "0.3.9",
+                "latest_version": "v0.4.0",
+                "download_url": "https://github.com/CHENXCHEN/AutoCLI/releases/tag/v0.4.0",
+                "published_at": "2026-11-18T00:00:00Z",
+                "update_available": true
+            }))
+        );
+        assert_eq!(release_update_info(&json!({}), "0.3.9"), None);
+    }
 
     type TestExtensionSocket = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,

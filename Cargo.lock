@@ -86,7 +86,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "autocli"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "autocli-ai",
  "autocli-browser",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "autocli-ai"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "async-trait",
  "autocli-browser",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "autocli-browser"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "async-trait",
  "autocli-core",
@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "autocli-core"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "async-trait",
  "serde",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "autocli-discovery"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "autocli-core",
  "autocli-pipeline",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "autocli-external"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "autocli-core",
  "serde",
@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "autocli-output"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "autocli-core",
  "colored",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "autocli-pipeline"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "async-trait",
  "autocli-core",
