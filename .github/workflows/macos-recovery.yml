@@ -1,4 +1,4 @@
-name: Build v0.3.9 macOS recovery assets
+name: Build v0.3.9 macOS ARM recovery asset
 
 on:
   push:
@@ -21,8 +21,6 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-15
-          - target: x86_64-apple-darwin
             os: macos-15-intel
 
     steps:
