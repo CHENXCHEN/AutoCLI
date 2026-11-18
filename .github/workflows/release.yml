@@ -2,8 +2,9 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - 'codex/release-v039-recovery'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,8 +13,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify-tag:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 21fc5c7b1ffd1e43e8ae2330fdafcd1314a439df
+      - name: Check tag commit
+        run: |
+          test "$(git ls-remote origin refs/tags/v0.3.9 | cut -f1)" = "21fc5c7b1ffd1e43e8ae2330fdafcd1314a439df"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify-tag
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,6 +51,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 21fc5c7b1ffd1e43e8ae2330fdafcd1314a439df
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -82,9 +97,12 @@ jobs:
 
   extension:
     name: Build Chrome Extension
+    needs: verify-tag
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 21fc5c7b1ffd1e43e8ae2330fdafcd1314a439df
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -117,6 +135,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 21fc5c7b1ffd1e43e8ae2330fdafcd1314a439df
+
+      - name: Check release tag and absence of existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git ls-remote origin refs/tags/v0.3.9 | cut -f1)" = "21fc5c7b1ffd1e43e8ae2330fdafcd1314a439df"
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v0.3.9")
+          test "$status" = 404
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -147,6 +178,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v0.3.9
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
